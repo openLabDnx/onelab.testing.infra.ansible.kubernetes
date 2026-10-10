@@ -1,0 +1,118 @@
+---
+- name: List cloudflared pods
+  ansible.builtin.command: "{{ cloudflared_kubectl }} get pods -l app=cloudflared -o wide"
+  register: cloudflared_pods
+  changed_when: false
+  failed_when: false
+
+- name: Display cloudflared pods
+  ansible.builtin.debug:
+    msg: "{{ cloudflared_pods.stdout_lines + cloudflared_pods.stderr_lines }}"
+
+- name: Wait for the tunnel to report healthy
+  ansible.builtin.uri:
+    url: "{{ cloudflare_api_url }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}"
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token }}"
+    return_content: true
+  register: cloudflare_tunnel_health
+  until: cloudflare_tunnel_health.json.result.status | default('') == 'healthy'
+  retries: 12
+  delay: 5
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Display tunnel health
+  ansible.builtin.debug:
+    msg:
+      - "tunnel      {{ cloudflare_tunnel_name }} ({{ cloudflare_tunnel_id }})"
+      - "status      {{ tunnel.status | default('unknown') }}"
+      - "connections {{ tunnel.connections | default([]) | length }} via {{ tunnel.connections | default([]) | map(attribute='colo_name') | unique | sort | join(', ') }}"
+  vars:
+    tunnel: "{{ cloudflare_tunnel_health.json.result | default({}) }}"
+
+- name: Fail when the tunnel is not healthy
+  ansible.builtin.fail:
+    msg: "Tunnel is {{ cloudflare_tunnel_health.json.result.status | default('unreachable') }}. Check: {{ cloudflared_kubectl }} logs deploy/cloudflared"
+  when: cloudflare_tunnel_health.json.result.status | default('') != 'healthy'
+
+# Universal SSL only covers autofik.com and *.autofik.com. Names one level deeper
+# (vault.testing.autofik.com) need an Advanced Certificate (ACM) on the zone.
+- name: List edge certificates
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/zones/{{ cloudflare_zone_id }}/ssl/certificate_packs?status=all&per_page=50"
+    cf_allow_fail: true
+
+- name: Check edge certificate coverage
+  ansible.builtin.set_fact:
+    # covered when a certificate lists the name itself or the wildcard one level up
+    cloudflare_uncovered_hostnames: >-
+      {{ cloudflare_public_hostnames
+         | zip(cloudflare_public_hostnames | map('regex_replace', '^[^.]+\.', '*.'))
+         | rejectattr('0', 'in', covered_hosts)
+         | rejectattr('1', 'in', covered_hosts)
+         | map(attribute='0') | list }}
+  vars:
+    covered_hosts: "{{ cf_response.result | default([]) | selectattr('status', 'equalto', 'active') | map(attribute='hosts') | flatten | unique | list }}"
+  when: cf_response.success | default(false)
+
+- name: Warn about hostnames without an edge certificate
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: no active Cloudflare edge certificate covers {{ cloudflare_uncovered_hostnames }}."
+      - "Browsers will fail the TLS handshake for these names. Universal SSL only covers {{ cloudflare_zone_name }} and *.{{ cloudflare_zone_name }}."
+      - "Fix: SSL/TLS > Edge Certificates > Order an Advanced Certificate (ACM) for {{ cloudflare_base_domain }}, *.{{ cloudflare_base_domain }},"
+      - "or switch to first-level names (e.g. vault-testing.{{ cloudflare_zone_name }}) via cloudflare_vault_hostname."
+  when: cloudflare_uncovered_hostnames | default([]) | length > 0
+
+- name: Note when certificate coverage could not be checked
+  ansible.builtin.debug:
+    msg: "Edge certificates not checked (token lacks Zone > SSL and Certificates: Read): {{ cf_response.errors | default([]) | map(attribute='message') | join('; ') }}"
+  when: not (cf_response.success | default(false))
+
+# End-to-end probes from this machine through Cloudflare's edge.
+- name: Probe Vault hostname (expect a Cloudflare Access login redirect)
+  ansible.builtin.uri:
+    url: "https://{{ cloudflare_vault_hostname }}/ui/"
+    follow_redirects: none
+    status_code: [200, 302, 401, 403]
+  register: cloudflare_probe_vault
+  until: cloudflare_probe_vault.status in [200, 302, 401, 403]
+  retries: "{{ cloudflare_probe_retries }}"
+  delay: 10
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  when: cloudflare_vault_enabled
+
+- name: Probe wildcard hostname (expect Traefik 404 for an unknown app)
+  ansible.builtin.uri:
+    url: "https://tunnel-check.{{ cloudflare_base_domain }}/"
+    follow_redirects: none
+    status_code: [404]
+  register: cloudflare_probe_wildcard
+  until: cloudflare_probe_wildcard.status == 404
+  retries: "{{ cloudflare_probe_retries }}"
+  delay: 10
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  when: cloudflare_wildcard_to_traefik
+
+- name: Display probe results
+  ansible.builtin.debug:
+    msg:
+      - >-
+        {{ cloudflare_vault_hostname }}:
+        {% if not cloudflare_vault_enabled %}disabled
+        {% elif cloudflare_probe_vault.status == 302 and 'cloudflareaccess.com' in cloudflare_probe_vault.location | default('') %}OK - redirected to Cloudflare Access login
+        {% elif cloudflare_probe_vault.status == 200 %}reachable WITHOUT Access - check the Access application
+        {% else %}FAILED - {{ cloudflare_probe_vault.status }} {{ cloudflare_probe_vault.msg | default('') | truncate(200) }}{% endif %}
+      - >-
+        *.{{ cloudflare_base_domain }}:
+        {% if not cloudflare_wildcard_to_traefik %}disabled
+        {% elif cloudflare_probe_wildcard.status == 404 %}OK - reached Traefik (404 for an unknown host)
+        {% else %}FAILED - {{ cloudflare_probe_wildcard.status }} {{ cloudflare_probe_wildcard.msg | default('') | truncate(200) }}{% endif %}

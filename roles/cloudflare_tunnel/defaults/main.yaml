@@ -1,0 +1,67 @@
+---
+# Defaults for cloudflare_tunnel role
+# Remotely managed Cloudflare Tunnel for the RKE2 cluster: Ansible creates the
+# tunnel, its ingress rules, proxied DNS records and the Access app through the
+# Cloudflare API, then runs cloudflared in the cluster with the tunnel token.
+
+cloudflare_api_url: "https://api.cloudflare.com/client/v4"
+
+# API token: $CLOUDFLARE_API_TOKEN, else this git-ignored file. Required permissions:
+#   Account > Cloudflare Tunnel: Edit
+#   Account > Access: Apps and Policies: Edit
+#   Zone    > DNS: Edit                         (zone: autofik.com)
+#   Zone    > SSL and Certificates: Edit        (orders the *.testing.autofik.com edge certificate)
+cloudflare_api_token_file: "{{ inventory_dir }}/../secrets/cloudflare/api_token"
+
+# Optional connector token of a tunnel created in the dashboard ($CLOUDFLARE_TUNNEL_TOKEN
+# or this file). When set, that tunnel is used; otherwise one named cloudflare_tunnel_name is created.
+cloudflare_tunnel_token_file: "{{ inventory_dir }}/../secrets/cloudflare/tunnel_token"
+
+cloudflare_zone_name: "autofik.com"
+cloudflare_base_domain: "testing.autofik.com"
+cloudflare_tunnel_name: "autofik-rke2-testing"
+
+# Vault UI -> active Vault pod over HTTPS (verified with the Vault CA), behind Cloudflare Access.
+cloudflare_vault_enabled: true
+cloudflare_vault_hostname: "vault.{{ cloudflare_base_domain }}"
+cloudflare_vault_origin: "https://vault-active.vault.svc.cluster.local:8200"
+cloudflare_vault_ca_file: "{{ inventory_dir }}/../secrets/vault/tls/ca.crt"
+
+# Every other *.testing.autofik.com host goes to Traefik, so a new app only needs
+# an Ingress with its host; no Cloudflare change.
+cloudflare_wildcard_to_traefik: true
+cloudflare_traefik_origin: "http://rke2-traefik.kube-system.svc.cluster.local:80"
+
+# Existing A/AAAA records for these names that point straight at a cluster node
+# (e.g. the old DNS-only *.testing.autofik.com -> 46.250.224.184) are replaced by
+# the tunnel CNAME. Records pointing anywhere else always stop the run.
+cloudflare_dns_replace_node_records: true
+
+# Order an Advanced Certificate Manager pack when no edge certificate covers the
+# hostnames (Universal SSL stops at *.autofik.com). Requires ACM on the zone.
+cloudflare_order_edge_certificate: true
+
+# Extra rules placed before the wildcard, e.g.
+#   - { hostname: "grafana.testing.autofik.com", service: "http://grafana.monitoring.svc:3000" }
+cloudflare_extra_routes: []
+
+# Cloudflare Access in front of the Vault UI (on top of Vault's own login)
+cloudflare_access_app_name: "Vault (autofik testing)"
+cloudflare_access_policy_name: "Vault testing - allowed users"
+cloudflare_access_session_duration: "24h"
+cloudflare_access_allowed_email_domains: []
+cloudflare_access_allowed_emails:
+  - "mai.reaksa@autofik.com"
+
+# cloudflared in Kubernetes (one tunnel, several connector replicas for HA)
+cloudflared_namespace: "cloudflared"
+cloudflared_image: "cloudflare/cloudflared:2026.9.3"
+cloudflared_replicas: 2
+cloudflared_vault_ca_mount: "/etc/cloudflared/vault-ca"
+
+# Retries for the end-to-end HTTPS probes (new DNS names can take a moment)
+cloudflare_probe_retries: 6
+
+rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"
+cloudflared_kubectl: "{{ cluster_kubectl }} -n {{ cloudflared_namespace }}"

@@ -1,0 +1,58 @@
+---
+# Universal SSL covers only the apex and *.<zone>. Names one level deeper
+# (vault.testing.autofik.com) need an Advanced Certificate Manager pack; order one
+# when nothing (active or still validating) covers them. Needs Zone > SSL and Certificates: Edit.
+- name: List edge certificates
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/zones/{{ cloudflare_zone_id }}/ssl/certificate_packs?status=all&per_page=50"
+    cf_allow_fail: true
+
+- name: Find hostnames without an edge certificate
+  ansible.builtin.set_fact:
+    cloudflare_cert_missing: >-
+      {{ cloudflare_public_hostnames
+         | zip(cloudflare_public_hostnames | map('regex_replace', '^[^.]+\.', '*.'))
+         | rejectattr('0', 'in', pack_hosts)
+         | rejectattr('1', 'in', pack_hosts)
+         | map(attribute='1') | unique | list }}
+  vars:
+    # active packs and packs still being issued both count, so a pending order is never repeated
+    pack_hosts: >-
+      {{ cf_response.result | default([])
+         | rejectattr('status', 'in', ['deleted', 'expired', 'validation_timed_out', 'issuance_timed_out', 'deactivating', 'inactive'])
+         | map(attribute='hosts') | flatten | unique | list }}
+  when: cf_response.success | default(false)
+
+- name: Order advanced edge certificate for {{ cloudflare_cert_missing | default([]) | join(', ') }}
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: POST
+    cf_path: "/zones/{{ cloudflare_zone_id }}/ssl/certificate_packs/order"
+    cf_body:
+      type: advanced
+      hosts: "{{ [cloudflare_zone_name] + cloudflare_cert_missing }}"
+      validation_method: txt
+      validity_days: 90
+      certificate_authority: lets_encrypt
+    cf_allow_fail: true
+  when:
+    - cloudflare_order_edge_certificate
+    - cloudflare_cert_missing | default([]) | length > 0
+
+- name: Report certificate order result
+  ansible.builtin.debug:
+    msg: >-
+      {% if cf_response.success | default(false) %}Ordered edge certificate for {{ cloudflare_cert_missing }};
+      Cloudflare validates and deploys it within a few minutes.
+      {% else %}Could not order an edge certificate ({{ cf_response.errors | default([]) | map(attribute='message') | join('; ') }}).
+      Order it in SSL/TLS > Edge Certificates for {{ cloudflare_zone_name }}, {{ cloudflare_cert_missing | join(', ') }},
+      or give the token Zone > SSL and Certificates: Edit.{% endif %}
+  when:
+    - cloudflare_order_edge_certificate
+    - cloudflare_cert_missing | default([]) | length > 0
+
+- name: Note when edge certificates could not be listed
+  ansible.builtin.debug:
+    msg: "Edge certificates not checked (token lacks Zone > SSL and Certificates permission)."
+  when: not (cf_response.success | default(false)) and cloudflare_cert_missing is not defined

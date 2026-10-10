@@ -41,10 +41,14 @@ autofik.infra.testing/
 │   │   ├── handlers/main.yaml
 │   │   └── templates/config.yaml.j2
 │   ├── local_path_provisioner/  # StorageClasses local-path + local-path-retain
-│   └── vault/                   # Vault HA: helm, TLS, deploy, init, unseal, status, reset
-│       ├── defaults/main.yaml   # Versions, replicas, storage, UI exposure, key shares
+│   ├── vault/                   # Vault HA: helm, TLS, deploy, init, unseal, status, reset
+│   │   ├── defaults/main.yaml   # Versions, replicas, storage, UI exposure, key shares
+│   │   ├── tasks/
+│   │   └── templates/values.yaml.j2
+│   └── cloudflare_tunnel/       # Tunnel, routes, DNS, Access (Cloudflare API) + cloudflared
+│       ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
 │       ├── tasks/
-│       └── templates/values.yaml.j2
+│       └── templates/cloudflared.yaml.j2
 ├── playbooks/
 │   ├── 01-prerequisites.yaml    # Node system tuning & preparation
 │   ├── 02-rke2-server.yaml      # Master control-plane deployment
@@ -55,12 +59,15 @@ autofik.infra.testing/
 │   ├── vault-unseal.yaml        # Unseal Vault pods after restarts
 │   ├── vault-status.yaml        # Vault pods, seal state, raft peers
 │   ├── vault-reset.yaml         # Destroy Vault and its data (asks to confirm)
+│   ├── 07-cloudflare.yaml       # Cloudflare Tunnel + DNS + Access + cloudflared
+│   ├── cloudflare-status.yaml   # Tunnel health, edge certificates, live probes
+│   ├── cloudflare-reset.yaml    # Delete tunnel, its DNS records, Access app (asks to confirm)
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
 │   ├── setup_ssh_keys.sh       # Key generator & key distribution helper
 │   └── vault_ui_tunnel.sh      # SSH + port-forward tunnel to the Vault UI
-├── secrets/                     # (git-ignored) Vault unseal keys, root token, TLS CA/keys
+├── secrets/                     # (git-ignored) Vault keys + TLS, Cloudflare API token
 ├── site.yaml                    # Master orchestration entrypoint
 ├── Makefile                     # Shortcut CLI commands
 └── README.md
@@ -194,6 +201,76 @@ The StatefulSet uses `OnDelete`. After you bump `vault_version` / `vault_chart_v
 ### Destroy
 ```bash
 make vault-reset    # asks for confirmation; deletes Vault, its volumes and ALL secrets
+```
+
+---
+
+## ☁️ Cloudflare Tunnel
+
+The cluster is published through the Cloudflare Tunnel `f453e37b-…` (created in the Zero Trust dashboard), so no inbound ports are needed. Ansible manages that tunnel's routes, the DNS records, the edge certificate and the Access app through the Cloudflare API (the same approach as the sso-gateway `cloudflare-tunnel-route.sh`). `cloudflared` runs in the cluster with 2 replicas on different nodes.
+
+| Public hostname | Goes to | Protection |
+| :--- | :--- | :--- |
+| `vault.testing.autofik.com` | `vault-active` (HTTPS, verified with the Vault CA) | Cloudflare Access (`mai.reaksa@autofik.com`) + Vault login |
+| `*.testing.autofik.com` | Traefik (`rke2-traefik`), so any Ingress with that host | the app itself |
+| anything else | `404` | - |
+
+### One-time: tokens
+**Tunnel token:** put the connector token of the dashboard tunnel (the value after `cloudflared service install`) in `secrets/cloudflare/tunnel_token`. If that file doesn't exist, Ansible creates its own tunnel named `autofik-rke2-testing` instead.
+
+**API token:** create a **Custom Token** under dash.cloudflare.com → My Profile → API Tokens with:
+
+| Permission | Resource |
+| :--- | :--- |
+| Account › Cloudflare Tunnel › Edit | your account |
+| Account › Access: Apps and Policies › Edit | your account |
+| Zone › DNS › Edit | `autofik.com` |
+| Zone › SSL and Certificates › Edit | `autofik.com` |
+
+Save the token to `secrets/cloudflare/api_token` (git-ignored), or `export CLOUDFLARE_API_TOKEN=...`.
+Zero Trust must be enabled on the account, with the **One-time PIN** login method (Zero Trust → Settings → Authentication).
+
+### Deploy
+```bash
+make cloudflare             # routes, DNS, edge cert, Access, cloudflared, end-to-end probes (safe to re-run)
+make cloudflare-status      # tunnel health + connections, edge certificates, live probes
+make cloudflare-connector   # only (re)deploy cloudflared from the tunnel token, with no API calls
+```
+Ansible owns this tunnel's routes, so any route you add in the dashboard is replaced on the next run. Add routes in `cloudflare_extra_routes` instead (`roles/cloudflare_tunnel/defaults/main.yaml`).
+
+On the first run, the old DNS-only record `*.testing.autofik.com → 46.250.224.184` is replaced by the tunnel CNAME. Only records that point at one of this cluster's nodes are ever replaced; any other existing record stops the run. The nodes still accept direct traffic on ports 80/443, so firewall them if you want tunnel-only access.
+
+### Edge certificate for `*.testing.autofik.com`
+Universal SSL covers only `autofik.com` and `*.autofik.com`. Names two levels deep (`vault.testing.autofik.com`) need an Advanced Certificate Manager pack. The zone already has one for `*.master.autofik.com`. `make cloudflare` orders a Let's Encrypt pack for `autofik.com, *.testing.autofik.com` when nothing covers those names (`cloudflare_order_edge_certificate`). It never orders a second one while the first is still validating. Validation takes a few minutes; until then, browsers fail the TLS handshake on those names.
+
+### Publishing an app
+Create an Ingress with a host under `testing.autofik.com`. No Cloudflare change is needed:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: myapp.testing.autofik.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: myapp, port: { number: 80 } }
+```
+Cloudflare terminates TLS. `cloudflared` sends plain HTTP to Traefik inside the cluster.
+
+### Vault from outside the cluster
+The UI is at https://vault.testing.autofik.com: log in through Access, then with Vault.
+For CLI or automation, keep using `make vault-ui`, or create an Access **service token** and add an allow rule for it.
+
+### Remove
+```bash
+make cloudflare-reset    # asks for confirmation; deletes the DNS records, Access app/policy and cloudflared
+                         # (a tunnel supplied through tunnel_token is kept; a tunnel Ansible created is deleted)
 ```
 
 ---

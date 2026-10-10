@@ -1,0 +1,35 @@
+---
+# Tags: `cloudflared` deploys only the connector (needs a pinned tunnel token, no API
+# calls); `cloudflare_api` covers everything done through the Cloudflare API.
+- name: Load pinned tunnel token
+  ansible.builtin.import_tasks: tunnel_token.yaml
+  tags: [always]
+
+- name: Resolve Cloudflare zone, account and tunnel
+  ansible.builtin.import_tasks: lookup.yaml
+  tags: [cloudflare_api]
+
+- name: Ensure tunnel and its routes
+  ansible.builtin.import_tasks: tunnel.yaml
+  tags: [cloudflare_api]
+
+- name: Ensure DNS records
+  ansible.builtin.import_tasks: dns.yaml
+  tags: [cloudflare_api]
+
+- name: Ensure an edge certificate covers the hostnames
+  ansible.builtin.import_tasks: certificate.yaml
+  tags: [cloudflare_api]
+
+- name: Ensure Cloudflare Access for Vault
+  ansible.builtin.import_tasks: access.yaml
+  when: cloudflare_vault_enabled
+  tags: [cloudflare_api]
+
+- name: Run cloudflared in the cluster
+  ansible.builtin.import_tasks: kubernetes.yaml
+  tags: [cloudflared]
+
+- name: Verify tunnel end to end
+  ansible.builtin.import_tasks: verify.yaml
+  tags: [cloudflare_api]

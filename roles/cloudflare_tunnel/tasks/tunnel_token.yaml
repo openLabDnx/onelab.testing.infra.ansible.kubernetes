@@ -1,0 +1,28 @@
+---
+# Optional: a connector token for a tunnel created in the Zero Trust dashboard
+# (the value after `cloudflared service install`). When present, that tunnel is
+# managed instead of creating one by name. Token = base64 JSON {"a": account, "t": tunnel, "s": secret}.
+- name: Load pinned tunnel token
+  ansible.builtin.set_fact:
+    cloudflare_pinned_tunnel_token: >-
+      {{ (lookup('ansible.builtin.env', 'CLOUDFLARE_TUNNEL_TOKEN')
+          or lookup('ansible.builtin.file', cloudflare_tunnel_token_file, errors='ignore')
+          or '') | trim | regex_replace('^.*\s', '') }}
+  no_log: true
+
+- name: Decode pinned tunnel token
+  ansible.builtin.set_fact:
+    cloudflare_tunnel_token: "{{ cloudflare_pinned_tunnel_token }}"
+    cloudflare_pinned_account_id: "{{ decoded.a }}"
+    cloudflare_tunnel_id: "{{ decoded.t }}"
+    cloudflare_tunnel_target: "{{ decoded.t }}.cfargotunnel.com"
+  vars:
+    padded: "{{ cloudflare_pinned_tunnel_token ~ ('=' * ((4 - cloudflare_pinned_tunnel_token | length % 4) % 4)) }}"
+    decoded: "{{ padded | b64decode | from_json }}"
+  when: cloudflare_pinned_tunnel_token | length > 0
+  no_log: true
+
+- name: Show pinned tunnel
+  ansible.builtin.debug:
+    msg: "Using tunnel {{ cloudflare_tunnel_id }} from {{ cloudflare_tunnel_token_file | basename }} (account {{ cloudflare_pinned_account_id }})"
+  when: cloudflare_pinned_tunnel_token | length > 0

@@ -1,5 +1,6 @@
 .PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods \
-	storage vault vault-unseal vault-status vault-ui vault-reset
+	storage vault vault-unseal vault-status vault-ui vault-reset \
+	cloudflare cloudflare-connector cloudflare-status cloudflare-reset
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -25,6 +26,11 @@ help:
 	@echo "make vault-status: Show Vault pods, seal state and raft peers"
 	@echo "make vault-ui    : SSH tunnel to the Vault UI at https://127.0.0.1:8200"
 	@echo "make vault-reset : DESTROY Vault and all of its data"
+	@echo "-----------------------------------------------------------------"
+	@echo "make cloudflare        : Cloudflare Tunnel, DNS, Access + cloudflared"
+	@echo "make cloudflare-connector : Only (re)deploy cloudflared (no API calls)"
+	@echo "make cloudflare-status : Tunnel health, edge certs, live probes"
+	@echo "make cloudflare-reset  : Delete tunnel, DNS records, Access app"
 	@echo "================================================================="
 
 check:
@@ -71,6 +77,18 @@ vault-ui:
 
 vault-reset:
 	ansible-playbook playbooks/vault-reset.yaml
+
+cloudflare:
+	ansible-playbook playbooks/07-cloudflare.yaml
+
+cloudflare-connector:
+	ansible-playbook playbooks/07-cloudflare.yaml --tags cloudflared
+
+cloudflare-status:
+	ansible-playbook playbooks/cloudflare-status.yaml
+
+cloudflare-reset:
+	ansible-playbook playbooks/cloudflare-reset.yaml
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

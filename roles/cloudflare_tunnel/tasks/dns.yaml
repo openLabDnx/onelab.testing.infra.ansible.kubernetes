@@ -1,0 +1,6 @@
+---
+- name: Ensure proxied CNAME for each public hostname
+  ansible.builtin.include_tasks: dns_record.yaml
+  loop: "{{ cloudflare_public_hostnames }}"
+  loop_control:
+    loop_var: dns_hostname

@@ -1,0 +1,75 @@
+---
+# Resolves the API token, zone, account and (if it exists) the tunnel. Creates nothing.
+- name: Load Cloudflare API token
+  ansible.builtin.set_fact:
+    cloudflare_api_token: >-
+      {{ (lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN')
+          or lookup('ansible.builtin.file', cloudflare_api_token_file, errors='ignore')
+          or '') | trim }}
+  no_log: true
+
+- name: Ensure a Cloudflare API token is available
+  ansible.builtin.assert:
+    that: cloudflare_api_token | length > 0
+    fail_msg: >-
+      No Cloudflare API token. Save it to {{ cloudflare_api_token_file }} (git-ignored)
+      or export CLOUDFLARE_API_TOKEN. Permissions: Account > Cloudflare Tunnel: Edit,
+      Account > Access: Apps and Policies: Edit, Zone > DNS: Edit,
+      Zone > SSL and Certificates: Edit.
+    quiet: true
+
+- name: Look up zone {{ cloudflare_zone_name }}
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/zones?name={{ cloudflare_zone_name }}"
+
+- name: Fail when the zone is not visible to the token
+  ansible.builtin.fail:
+    msg: "Zone {{ cloudflare_zone_name }} not found. Is it on this Cloudflare account, and included in the token's Zone Resources?"
+  when: cf_response.result | length == 0
+
+- name: Record zone and account
+  ansible.builtin.set_fact:
+    cloudflare_zone_id: "{{ cf_response.result[0].id }}"
+    cloudflare_account_id: "{{ cf_response.result[0].account.id }}"
+
+- name: Fail when the pinned tunnel belongs to another account
+  ansible.builtin.fail:
+    msg: "The tunnel token is for account {{ cloudflare_pinned_account_id }}, but zone {{ cloudflare_zone_name }} is in account {{ cloudflare_account_id }}."
+  when:
+    - cloudflare_pinned_tunnel_token | length > 0
+    - cloudflare_pinned_account_id != cloudflare_account_id
+
+- name: Look up pinned tunnel
+  when: cloudflare_pinned_tunnel_token | length > 0
+  block:
+    - name: Get tunnel {{ cloudflare_tunnel_id }}
+      ansible.builtin.include_tasks: api.yaml
+      vars:
+        cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}"
+
+    - name: Record pinned tunnel name
+      ansible.builtin.set_fact:
+        cloudflare_tunnel_name: "{{ cf_response.result.name }}"
+
+- name: Look up tunnel by name
+  when: cloudflare_pinned_tunnel_token | length == 0
+  block:
+    - name: Look up tunnel {{ cloudflare_tunnel_name }}
+      ansible.builtin.include_tasks: api.yaml
+      vars:
+        cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel?name={{ cloudflare_tunnel_name }}&is_deleted=false"
+
+    - name: Record tunnel id (empty when it does not exist yet)
+      ansible.builtin.set_fact:
+        cloudflare_tunnel_id: "{{ tunnel_id }}"
+        cloudflare_tunnel_target: "{{ (tunnel_id ~ '.cfargotunnel.com') if tunnel_id | length > 0 else '' }}"
+      vars:
+        tunnel_id: "{{ cf_response.result[0].id if cf_response.result | length > 0 else '' }}"
+
+- name: Build public hostname list
+  ansible.builtin.set_fact:
+    cloudflare_public_hostnames: >-
+      {{ ([cloudflare_vault_hostname] if cloudflare_vault_enabled else [])
+         + (cloudflare_extra_routes | map(attribute='hostname') | list)
+         + (['*.' ~ cloudflare_base_domain] if cloudflare_wildcard_to_traefik else []) }}
