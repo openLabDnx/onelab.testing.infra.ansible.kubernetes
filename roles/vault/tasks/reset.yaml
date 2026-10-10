@@ -1,0 +1,44 @@
+---
+- name: Uninstall Vault Helm release
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: "{{ vault_release_name }}"
+    release_namespace: "{{ vault_namespace }}"
+    state: absent
+    wait: true
+
+- name: Find Vault persistent volumes
+  ansible.builtin.command: >
+    {{ vault_kubectl }} get pvc -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}'
+  register: vault_pvs
+  changed_when: false
+  failed_when: false
+
+# Volumes use reclaimPolicy Retain; switch to Delete so local-path-provisioner wipes the data dirs.
+- name: Switch Vault volumes to reclaimPolicy Delete
+  ansible.builtin.command: >
+    {{ cluster_kubectl }} patch pv {{ item }}
+    -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+  loop: "{{ vault_pvs.stdout_lines | select | list }}"
+
+- name: Delete Vault namespace (PVCs, TLS secret)
+  ansible.builtin.command: "{{ cluster_kubectl }} delete namespace {{ vault_namespace }} --ignore-not-found --timeout=300s"
+  register: vault_ns_delete
+  changed_when: vault_ns_delete.stdout is search('deleted')
+
+- name: Wait for Vault volumes to be removed
+  ansible.builtin.command: "{{ cluster_kubectl }} get pv {{ item }} --ignore-not-found -o name"
+  loop: "{{ vault_pvs.stdout_lines | select | list }}"
+  register: vault_pv_gone
+  until: vault_pv_gone.stdout | length == 0
+  retries: 30
+  delay: 5
+  changed_when: false
+
+- name: Retire local unseal keys (they belong to the destroyed cluster)
+  ansible.builtin.command: "mv {{ vault_init_file }} {{ vault_init_file }}.destroyed-{{ now(fmt='%Y%m%d%H%M%S') }}"
+  args:
+    removes: "{{ vault_init_file }}"
+  delegate_to: localhost
+  become: false

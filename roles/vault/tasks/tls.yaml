@@ -1,0 +1,123 @@
+---
+# The CA and server certificate are generated on the Ansible controller and kept
+# under secrets/vault/tls (git-ignored). Only ca.crt, tls.crt and tls.key are
+# pushed to the cluster as a Kubernetes secret.
+- name: Build Vault certificate SAN list
+  ansible.builtin.set_fact:
+    vault_tls_sans: >-
+      {{
+        (vault_service_names | product(vault_dns_suffixes) | map('join') | map('regex_replace', '^', 'DNS:') | list)
+        + (vault_dns_suffixes | map('regex_replace', '^', 'DNS:*.' ~ vault_release_name ~ '-internal') | list)
+        + ['DNS:localhost', 'IP:127.0.0.1']
+        + (groups['rke2_cluster'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '^', 'IP:') | list)
+        + vault_tls_extra_sans
+      }}
+  vars:
+    vault_service_names:
+      - "{{ vault_release_name }}"
+      - "{{ vault_release_name }}-active"
+      - "{{ vault_release_name }}-standby"
+      - "{{ vault_release_name }}-internal"
+      - "{{ vault_release_name }}-ui"
+    vault_dns_suffixes:
+      - ""
+      - ".{{ vault_namespace }}"
+      - ".{{ vault_namespace }}.svc"
+      - ".{{ vault_namespace }}.svc.cluster.local"
+
+- name: Generate Vault TLS material on the controller
+  delegate_to: localhost
+  become: false
+  run_once: true
+  block:
+    - name: Ensure local Vault secrets directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ vault_local_secrets_dir }}"
+        - "{{ vault_local_tls_dir }}"
+
+    - name: Generate CA private key
+      community.crypto.openssl_privatekey:
+        path: "{{ vault_local_tls_dir }}/ca.key"
+        type: RSA
+        size: 4096
+        mode: "0600"
+
+    - name: Generate CA CSR
+      community.crypto.openssl_csr:
+        path: "{{ vault_local_tls_dir }}/ca.csr"
+        privatekey_path: "{{ vault_local_tls_dir }}/ca.key"
+        common_name: "Autofik Vault CA"
+        basic_constraints: ["CA:TRUE"]
+        basic_constraints_critical: true
+        key_usage: ["keyCertSign", "cRLSign"]
+        key_usage_critical: true
+        mode: "0600"
+
+    - name: Self-sign CA certificate
+      community.crypto.x509_certificate:
+        path: "{{ vault_local_tls_dir }}/ca.crt"
+        csr_path: "{{ vault_local_tls_dir }}/ca.csr"
+        privatekey_path: "{{ vault_local_tls_dir }}/ca.key"
+        provider: selfsigned
+        selfsigned_not_after: "+{{ vault_tls_ca_days }}d"
+        mode: "0644"
+
+    - name: Generate Vault server private key
+      community.crypto.openssl_privatekey:
+        path: "{{ vault_local_tls_dir }}/tls.key"
+        type: RSA
+        size: 2048
+        mode: "0600"
+
+    - name: Generate Vault server CSR
+      community.crypto.openssl_csr:
+        path: "{{ vault_local_tls_dir }}/tls.csr"
+        privatekey_path: "{{ vault_local_tls_dir }}/tls.key"
+        common_name: "{{ vault_release_name }}.{{ vault_namespace }}.svc"
+        subject_alt_name: "{{ vault_tls_sans }}"
+        key_usage: ["digitalSignature", "keyEncipherment"]
+        extended_key_usage: ["serverAuth", "clientAuth"]
+        mode: "0600"
+
+    - name: Sign Vault server certificate with the CA
+      community.crypto.x509_certificate:
+        path: "{{ vault_local_tls_dir }}/tls.crt"
+        csr_path: "{{ vault_local_tls_dir }}/tls.csr"
+        provider: ownca
+        ownca_path: "{{ vault_local_tls_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ vault_local_tls_dir }}/ca.key"
+        ownca_not_after: "+{{ vault_tls_cert_days }}d"
+        mode: "0644"
+
+- name: Create Vault namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ vault_namespace }}
+  register: vault_ns_apply
+  changed_when: vault_ns_apply.stdout is search('(created|configured)')
+
+- name: Create Vault TLS secret
+  ansible.builtin.command:
+    cmd: "{{ vault_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: {{ vault_tls_secret_name }}
+        namespace: {{ vault_namespace }}
+      data:
+        ca.crt: {{ lookup('file', vault_local_tls_dir ~ '/ca.crt') | b64encode }}
+        tls.crt: {{ lookup('file', vault_local_tls_dir ~ '/tls.crt') | b64encode }}
+        tls.key: {{ lookup('file', vault_local_tls_dir ~ '/tls.key') | b64encode }}
+  register: vault_tls_apply
+  changed_when: vault_tls_apply.stdout is search('(created|configured)')
+  no_log: true

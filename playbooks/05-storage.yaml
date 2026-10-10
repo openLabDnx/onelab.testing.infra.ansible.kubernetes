@@ -1,0 +1,7 @@
+---
+- name: Install local-path-provisioner (node-local PersistentVolumes)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  roles:
+    - local_path_provisioner

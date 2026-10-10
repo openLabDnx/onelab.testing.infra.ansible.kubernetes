@@ -1,0 +1,14 @@
+---
+# Defaults for local_path_provisioner role
+# RKE2 ships without a StorageClass; Rancher's local-path-provisioner gives each
+# node node-local PersistentVolumes (data lives under /opt/local-path-provisioner).
+local_path_provisioner_version: "v0.0.37"
+local_path_provisioner_manifest_url: "https://raw.githubusercontent.com/rancher/local-path-provisioner/{{ local_path_provisioner_version }}/deploy/local-path-storage.yaml"
+local_path_provisioner_manifest_dir: "/opt/autofik/manifests"
+
+# Extra StorageClass with reclaimPolicy Retain, used by stateful workloads such as
+# Vault so deleting a PVC by mistake does not wipe the data on disk.
+local_path_retain_class_name: "local-path-retain"
+
+rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"

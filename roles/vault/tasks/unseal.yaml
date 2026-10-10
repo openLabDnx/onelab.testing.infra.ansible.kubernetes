@@ -1,0 +1,42 @@
+---
+- name: Discover Vault server pods
+  ansible.builtin.command: "{{ vault_kubectl }} get pods -l {{ vault_server_selector }} -o json"
+  register: vault_pods_raw
+  changed_when: false
+
+- name: Collect running Vault server pods
+  ansible.builtin.set_fact:
+    vault_all_pods: "{{ vault_pods_json['items'] | map(attribute='metadata.name') | sort | list }}"
+    vault_running_pods: "{{ vault_pods_json['items'] | selectattr('status.phase', 'equalto', 'Running') | map(attribute='metadata.name') | sort | list }}"
+    vault_pod_states: []
+  vars:
+    vault_pods_json: "{{ vault_pods_raw.stdout | from_json }}"
+
+- name: Warn about Vault pods that are not running
+  ansible.builtin.debug:
+    msg: "Skipping pods that are not Running (node down?): {{ vault_all_pods | difference(vault_running_pods) }}"
+  when: vault_all_pods | difference(vault_running_pods) | length > 0
+
+- name: Read seal status of running Vault pods
+  ansible.builtin.command: "{{ vault_kubectl }} exec {{ item }} -c vault -- vault status -format=json"
+  loop: "{{ vault_running_pods }}"
+  register: vault_seal_check
+  changed_when: false
+  failed_when: false
+
+- name: Record pod initialization state
+  ansible.builtin.set_fact:
+    vault_pod_states: "{{ vault_pod_states + [{'name': item.item, 'initialized': (item.stdout | from_json).initialized if item.rc in [0, 2] else false}] }}"
+  loop: "{{ vault_seal_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# Pods that hold data first: a fresh pod can only complete its raft retry_join
+# once an unsealed leader exists.
+- name: Unseal each Vault pod
+  ansible.builtin.include_tasks: unseal_pod.yaml
+  loop: >-
+    {{ (vault_pod_states | selectattr('initialized') | map(attribute='name') | list)
+       + (vault_pod_states | rejectattr('initialized') | map(attribute='name') | list) }}
+  loop_control:
+    loop_var: vault_pod

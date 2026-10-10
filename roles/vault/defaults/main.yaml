@@ -1,0 +1,55 @@
+---
+# Defaults for vault role
+# HashiCorp Vault in HA mode (Raft integrated storage) on the RKE2 cluster,
+# deployed with the official Helm chart and TLS end to end.
+
+vault_namespace: "vault"
+vault_release_name: "vault"            # also used as fullnameOverride -> pods vault-0..N, svc vault-active
+vault_chart_repo_url: "https://helm.releases.hashicorp.com"
+vault_chart_version: "0.34.1"
+vault_version: "2.0.4"
+
+# One Raft voter per node (required pod anti-affinity) -> tolerates losing 1 of 3 nodes.
+vault_replicas: 3
+vault_data_size: "10Gi"
+vault_storage_class: "local-path-retain"
+
+vault_server_resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    memory: "1Gi"
+
+# Agent injector lets workloads receive secrets through pod annotations.
+vault_injector_enabled: true
+vault_injector_replicas: 2
+
+# UI / API service. ClusterIP keeps Vault private (use `make vault-ui` to tunnel in).
+# Set to NodePort to expose https://<any-node-ip>:<vault_ui_node_port> publicly.
+vault_ui_service_type: "ClusterIP"
+vault_ui_node_port: 32200
+
+# Shamir unseal keys
+vault_key_shares: 5
+vault_key_threshold: 3
+
+# Self-signed CA + server certificate, generated on the Ansible controller
+vault_tls_secret_name: "vault-tls"
+vault_tls_ca_days: 3650
+vault_tls_cert_days: 1825
+vault_tls_extra_sans: []               # e.g. ["DNS:vault.example.com"]
+
+# Local (controller) files: unseal keys, root token, TLS material. Git-ignored.
+vault_local_secrets_dir: "{{ inventory_dir }}/../secrets/vault"
+vault_local_tls_dir: "{{ vault_local_secrets_dir }}/tls"
+vault_init_file: "{{ vault_local_secrets_dir }}/vault-init.json"
+
+# Helm binary installed on the primary server node
+helm_version: "v3.22.0"
+helm_binary_path: "/usr/local/bin/helm"
+
+rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"
+vault_kubectl: "{{ cluster_kubectl }} -n {{ vault_namespace }}"
+vault_server_selector: "app.kubernetes.io/instance={{ vault_release_name }},component=server"

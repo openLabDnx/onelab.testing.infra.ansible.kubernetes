@@ -1,0 +1,17 @@
+---
+- name: Show HashiCorp Vault HA status
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Load root token (optional, used for raft peer list)
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: load_keys.yaml
+      vars:
+        vault_keys_required: false
+
+    - name: Show Vault cluster status
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: status.yaml

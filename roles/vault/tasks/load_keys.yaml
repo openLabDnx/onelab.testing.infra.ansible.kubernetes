@@ -1,0 +1,22 @@
+---
+- name: Check for local Vault init file
+  ansible.builtin.stat:
+    path: "{{ vault_init_file }}"
+  delegate_to: localhost
+  become: false
+  register: vault_init_file_stat
+
+- name: Fail when unseal keys are missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ vault_init_file }} not found. Vault is already initialized, so the unseal keys
+      must be restored to that path (JSON output of `vault operator init -format=json`).
+  when:
+    - not vault_init_file_stat.stat.exists
+    - vault_keys_required | default(true)
+
+- name: Load Vault unseal keys and root token
+  ansible.builtin.set_fact:
+    vault_init_data: "{{ lookup('ansible.builtin.file', vault_init_file) | from_json }}"
+  when: vault_init_file_stat.stat.exists
+  no_log: true

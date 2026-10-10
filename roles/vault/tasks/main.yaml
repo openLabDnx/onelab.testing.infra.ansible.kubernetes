@@ -1,0 +1,18 @@
+---
+- name: Install Helm on the primary server
+  ansible.builtin.import_tasks: helm.yaml
+
+- name: Generate TLS material and Kubernetes secret
+  ansible.builtin.import_tasks: tls.yaml
+
+- name: Deploy Vault Helm release
+  ansible.builtin.import_tasks: deploy.yaml
+
+- name: Initialize Vault cluster
+  ansible.builtin.import_tasks: init.yaml
+
+- name: Unseal Vault pods
+  ansible.builtin.import_tasks: unseal.yaml
+
+- name: Verify Vault HA cluster
+  ansible.builtin.import_tasks: verify.yaml
