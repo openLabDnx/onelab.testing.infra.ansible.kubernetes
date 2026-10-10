@@ -1,0 +1,74 @@
+---
+- name: Create tunnel {{ cloudflare_tunnel_name }}
+  when: cloudflare_tunnel_id | length == 0
+  block:
+    - name: Create remotely managed tunnel
+      ansible.builtin.include_tasks: api.yaml
+      vars:
+        cf_method: POST
+        cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+        cf_body:
+          name: "{{ cloudflare_tunnel_name }}"
+          config_src: cloudflare
+
+    - name: Record new tunnel id
+      ansible.builtin.set_fact:
+        cloudflare_tunnel_id: "{{ cf_response.result.id }}"
+
+- name: Fetch tunnel connector token
+  when: cloudflare_pinned_tunnel_token | length == 0
+  block:
+    - name: Get tunnel token
+      ansible.builtin.include_tasks: api.yaml
+      vars:
+        cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}/token"
+        cf_sensitive: true
+
+    - name: Record tunnel token
+      ansible.builtin.set_fact:
+        cloudflare_tunnel_token: "{{ cf_response.result }}"
+        cloudflare_tunnel_target: "{{ cloudflare_tunnel_id }}.cfargotunnel.com"
+      no_log: true
+
+# Rules are evaluated top-down: Vault, extra routes, wildcard -> Traefik, then 404.
+- name: Build tunnel ingress rules
+  ansible.builtin.set_fact:
+    cloudflare_ingress_rules: >-
+      {{ ([{'hostname': cloudflare_vault_hostname,
+            'service': cloudflare_vault_origin,
+            'originRequest': {'caPool': cloudflared_vault_ca_mount ~ '/ca.crt'}}]
+          if cloudflare_vault_enabled else [])
+         + cloudflare_extra_routes
+         + ([{'hostname': '*.' ~ cloudflare_base_domain, 'service': cloudflare_traefik_origin}]
+            if cloudflare_wildcard_to_traefik else [])
+         + [{'service': 'http_status:404'}] }}
+
+- name: Read current tunnel configuration
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}/configurations"
+
+# Ansible owns this tunnel's routes: anything added in the dashboard is replaced.
+- name: Compare tunnel ingress rules
+  ansible.builtin.set_fact:
+    cloudflare_ingress_changed: >-
+      {{ (current | map(attribute='hostname', default='') | list) != (desired | map(attribute='hostname', default='') | list)
+         or (current | map(attribute='service') | list) != (desired | map(attribute='service') | list)
+         or (current | map(attribute='originRequest', default={}) | list) != (desired | map(attribute='originRequest', default={}) | list) }}
+  vars:
+    current: "{{ ((cf_response.result | default({}, true)).config | default({}, true)).ingress | default([], true) }}"
+    desired: "{{ cloudflare_ingress_rules }}"
+
+- name: Update tunnel ingress rules
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: PUT
+    cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}/configurations"
+    cf_body:
+      config:
+        ingress: "{{ cloudflare_ingress_rules }}"
+  when: cloudflare_ingress_changed | bool
+
+- name: Display tunnel routes
+  ansible.builtin.debug:
+    msg: "{{ cloudflare_ingress_rules | map(attribute='hostname', default='(catch-all)') | zip(cloudflare_ingress_rules | map(attribute='service')) | map('join', ' -> ') | list }}"

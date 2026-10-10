@@ -1,0 +1,29 @@
+---
+- name: Remove the Cloudflare Tunnel, its DNS records, Access app and cloudflared
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  vars_prompt:
+    - name: cloudflare_reset_confirm
+      prompt: "This deletes the tunnel, its DNS records and the Vault Access app. Type 'destroy-tunnel' to continue"
+      private: no
+  tasks:
+    - name: Abort unless confirmed
+      ansible.builtin.fail:
+        msg: "Confirmation not given, nothing was changed."
+      when: cloudflare_reset_confirm != 'destroy-tunnel'
+
+    - name: Load pinned tunnel token
+      ansible.builtin.include_role:
+        name: cloudflare_tunnel
+        tasks_from: tunnel_token.yaml
+
+    - name: Resolve Cloudflare zone, account and tunnel
+      ansible.builtin.include_role:
+        name: cloudflare_tunnel
+        tasks_from: lookup.yaml
+
+    - name: Tear down Cloudflare resources
+      ansible.builtin.include_role:
+        name: cloudflare_tunnel
+        tasks_from: reset.yaml

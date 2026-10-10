@@ -1,0 +1,68 @@
+---
+- name: Ensure a tunnel token is available
+  ansible.builtin.assert:
+    that: cloudflare_tunnel_token | default('') | length > 0
+    fail_msg: >-
+      No tunnel token. Save the connector token to {{ cloudflare_tunnel_token_file }},
+      or run without `--tags cloudflared` so it is fetched through the API.
+    quiet: true
+
+- name: Create cloudflared namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ cloudflared_namespace }}
+  register: cloudflared_ns_apply
+  changed_when: cloudflared_ns_apply.stdout is search('(created|configured)')
+
+- name: Create cloudflared tunnel token secret
+  ansible.builtin.command:
+    cmd: "{{ cloudflared_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: cloudflared-token
+        namespace: {{ cloudflared_namespace }}
+      data:
+        token: {{ cloudflare_tunnel_token | b64encode }}
+  register: cloudflared_secret_apply
+  changed_when: cloudflared_secret_apply.stdout is search('(created|configured)')
+  no_log: true
+
+# cloudflared verifies Vault's self-signed certificate with this CA (caPool in the tunnel route).
+- name: Publish Vault CA for cloudflared
+  ansible.builtin.command:
+    cmd: "{{ cloudflared_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: vault-ca
+        namespace: {{ cloudflared_namespace }}
+      data:
+        ca.crt: |
+          {{ lookup('ansible.builtin.file', cloudflare_vault_ca_file) | indent(4) }}
+  register: cloudflared_ca_apply
+  changed_when: cloudflared_ca_apply.stdout is search('(created|configured)')
+  when: cloudflare_vault_enabled
+
+- name: Deploy cloudflared
+  ansible.builtin.command:
+    cmd: "{{ cloudflared_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'cloudflared.yaml.j2') }}"
+  register: cloudflared_apply
+  changed_when: cloudflared_apply.stdout is search('(created|configured)')
+
+# Env vars from a secret are only read at container start.
+- name: Restart cloudflared after a token change
+  ansible.builtin.command: "{{ cloudflared_kubectl }} rollout restart deployment/cloudflared"
+  when: cloudflared_secret_apply.stdout is search('configured')
+
+- name: Wait for cloudflared rollout
+  ansible.builtin.command: "{{ cloudflared_kubectl }} rollout status deployment/cloudflared --timeout=180s"
+  changed_when: false

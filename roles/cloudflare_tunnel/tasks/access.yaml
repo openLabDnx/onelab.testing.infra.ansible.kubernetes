@@ -1,0 +1,97 @@
+---
+- name: Build Access policy include rules
+  ansible.builtin.set_fact:
+    cloudflare_access_include: >-
+      {{ (cloudflare_access_allowed_email_domains
+          | map('community.general.dict_kv', 'domain') | map('community.general.dict_kv', 'email_domain') | list)
+         + (cloudflare_access_allowed_emails
+          | map('community.general.dict_kv', 'email') | map('community.general.dict_kv', 'email') | list) }}
+
+- name: Ensure the Access policy allows someone
+  ansible.builtin.assert:
+    that: cloudflare_access_include | length > 0
+    fail_msg: "Set cloudflare_access_allowed_email_domains or cloudflare_access_allowed_emails."
+    quiet: true
+
+# --- reusable policy --------------------------------------------------------
+- name: List Access policies
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/policies?per_page=100"
+
+- name: Find Access policy {{ cloudflare_access_policy_name }}
+  ansible.builtin.set_fact:
+    access_policy: "{{ cf_response.result | selectattr('name', 'equalto', cloudflare_access_policy_name) | first | default({}) }}"
+    access_policy_body:
+      name: "{{ cloudflare_access_policy_name }}"
+      decision: allow
+      include: "{{ cloudflare_access_include }}"
+      session_duration: "{{ cloudflare_access_session_duration }}"
+
+- name: Create Access policy
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: POST
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/policies"
+    cf_body: "{{ access_policy_body }}"
+  when: access_policy | length == 0
+
+- name: Update Access policy when its rules changed
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: PUT
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/policies/{{ access_policy.id }}"
+    cf_body: "{{ access_policy_body }}"
+  when:
+    - access_policy | length > 0
+    - access_policy.include != cloudflare_access_include or access_policy.decision != 'allow'
+      or access_policy.session_duration | default('') != cloudflare_access_session_duration
+
+- name: Record Access policy id
+  ansible.builtin.set_fact:
+    access_policy_id: "{{ access_policy.id if access_policy | length > 0 else cf_response.result.id }}"
+
+# --- application ------------------------------------------------------------
+- name: Look up Access application for {{ cloudflare_vault_hostname }}
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps?domain={{ cloudflare_vault_hostname }}&exact=true"
+
+- name: Find Access application
+  ansible.builtin.set_fact:
+    access_app: "{{ cf_response.result | selectattr('domain', 'equalto', cloudflare_vault_hostname) | first | default({}) }}"
+    access_app_body:
+      name: "{{ cloudflare_access_app_name }}"
+      domain: "{{ cloudflare_vault_hostname }}"
+      type: self_hosted
+      session_duration: "{{ cloudflare_access_session_duration }}"
+      app_launcher_visible: true
+      policies:
+        - id: "{{ access_policy_id }}"
+          precedence: 1
+
+- name: Create Access application
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: POST
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps"
+    cf_body: "{{ access_app_body }}"
+  when: access_app | length == 0
+
+- name: Update Access application when it drifted
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: PUT
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps/{{ access_app.id }}"
+    cf_body: "{{ access_app_body }}"
+  when:
+    - access_app | length > 0
+    - access_app.name != cloudflare_access_app_name
+      or access_app.session_duration | default('') != cloudflare_access_session_duration
+      or (access_app.policies | default([]) | map(attribute='id') | list) != [access_policy_id]
+
+- name: Display Access protection
+  ansible.builtin.debug:
+    msg: >-
+      https://{{ cloudflare_vault_hostname }} is behind Cloudflare Access, allowed:
+      {{ (cloudflare_access_allowed_email_domains | map('regex_replace', '^', '@') | list) + cloudflare_access_allowed_emails }}

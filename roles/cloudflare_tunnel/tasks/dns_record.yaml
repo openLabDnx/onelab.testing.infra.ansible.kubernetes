@@ -1,0 +1,61 @@
+---
+- name: "{{ dns_hostname }} | look up DNS records"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/zones/{{ cloudflare_zone_id }}/dns_records?name={{ dns_hostname | urlencode }}"
+
+# in_place:  already a proxied CNAME to this tunnel
+# replace:   A/AAAA records that point straight at this cluster's nodes (direct
+#            exposure the tunnel supersedes); swapped for the tunnel CNAME
+# otherwise: the name routes somewhere else -> stop, never repoint it
+- name: "{{ dns_hostname }} | classify existing records"
+  ansible.builtin.set_fact:
+    dns_existing: "{{ cf_response.result }}"
+    dns_in_place: >-
+      {{ cf_response.result | length == 1
+         and cf_response.result[0].type == 'CNAME'
+         and cf_response.result[0].content == cloudflare_tunnel_target
+         and cf_response.result[0].proxied | default(false) }}
+    dns_replace: >-
+      {{ cloudflare_dns_replace_node_records
+         and cf_response.result | length > 0
+         and cf_response.result | selectattr('type', 'in', ['A', 'AAAA'])
+             | selectattr('content', 'in', cluster_node_ips) | list | length == cf_response.result | length }}
+  vars:
+    cluster_node_ips: "{{ groups['rke2_cluster'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+- name: "{{ dns_hostname }} | refuse to overwrite a foreign record"
+  ansible.builtin.fail:
+    msg: >-
+      {{ dns_hostname }} already exists ({{ dns_existing | map(attribute='type') | zip(dns_existing | map(attribute='content'))
+      | map('join', ' ') | join(', ') }}) and does not point at this cluster. Remove it in the Cloudflare dashboard
+      or use another hostname; expected a proxied CNAME to {{ cloudflare_tunnel_target }}.
+  when:
+    - dns_existing | length > 0
+    - not dns_in_place
+    - not dns_replace
+
+- name: "{{ dns_hostname }} | remove direct-to-node records"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: DELETE
+    cf_path: "/zones/{{ cloudflare_zone_id }}/dns_records/{{ dns_old_record.id }}"
+  loop: "{{ dns_existing }}"
+  loop_control:
+    loop_var: dns_old_record
+    label: "{{ dns_old_record.type }} {{ dns_old_record.content }}"
+  when: dns_replace
+
+- name: "{{ dns_hostname }} | create proxied CNAME -> tunnel"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: POST
+    cf_path: "/zones/{{ cloudflare_zone_id }}/dns_records"
+    cf_body:
+      type: CNAME
+      name: "{{ dns_hostname }}"
+      content: "{{ cloudflare_tunnel_target }}"
+      proxied: true
+      ttl: 1
+      comment: "cloudflared tunnel {{ cloudflare_tunnel_name }} (managed by Ansible)"
+  when: dns_existing | length == 0 or dns_replace

@@ -1,0 +1,37 @@
+---
+# One Cloudflare API call.
+#   in:  cf_path, cf_method (GET), cf_body (optional), cf_allow_fail (false), cf_sensitive (false)
+#   out: cf_response (the JSON body)
+# no_log keeps the bearer token out of the output; Cloudflare's own error
+# messages are re-raised by the next task instead.
+- name: "Cloudflare API | {{ cf_method | default('GET') }} {{ cf_path | regex_replace('\\?.*$', '') }}"
+  ansible.builtin.uri:
+    url: "{{ cloudflare_api_url }}{{ cf_path }}"
+    method: "{{ cf_method | default('GET') }}"
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token }}"
+    body_format: json
+    body: "{{ cf_body | default(omit) }}"
+    return_content: true
+    timeout: 30
+  register: cf_raw
+  delegate_to: localhost
+  become: false
+  changed_when: cf_method | default('GET') != 'GET' and cf_raw.json.success | default(false)
+  failed_when: false
+  no_log: true
+
+- name: "Cloudflare API | check response"
+  ansible.builtin.fail:
+    msg: >-
+      Cloudflare API {{ cf_method | default('GET') }} {{ cf_path }} failed
+      (HTTP {{ cf_raw.status | default('?') }}):
+      {{ cf_raw.json.errors | default([]) | map('to_json') | join('; ') if cf_raw.json is defined else cf_raw.msg | default('no response') }}
+  when:
+    - not (cf_raw.json.success | default(false))
+    - not (cf_allow_fail | default(false))
+
+- name: "Cloudflare API | store response"
+  ansible.builtin.set_fact:
+    cf_response: "{{ cf_raw.json | default({'success': false, 'errors': [{'message': cf_raw.msg | default('no response')}]}) }}"
+  no_log: "{{ cf_sensitive | default(false) }}"

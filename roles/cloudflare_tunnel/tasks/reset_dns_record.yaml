@@ -1,0 +1,15 @@
+---
+- name: "{{ dns_hostname }} | look up DNS record"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/zones/{{ cloudflare_zone_id }}/dns_records?name={{ dns_hostname | urlencode }}"
+
+- name: "{{ dns_hostname }} | delete record pointing at this tunnel"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: DELETE
+    cf_path: "/zones/{{ cloudflare_zone_id }}/dns_records/{{ dns_record_item.id }}"
+  loop: "{{ cf_response.result | selectattr('type', 'equalto', 'CNAME') | selectattr('content', 'equalto', cloudflare_tunnel_target) | list }}"
+  loop_control:
+    loop_var: dns_record_item
+    label: "{{ dns_record_item.name }}"

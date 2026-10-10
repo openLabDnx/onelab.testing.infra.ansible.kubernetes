@@ -1,0 +1,7 @@
+---
+- name: Publish the cluster through Cloudflare Tunnel (Vault UI behind Access, *.testing -> Traefik)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  roles:
+    - cloudflare_tunnel

@@ -1,0 +1,61 @@
+---
+# Removes everything main.yaml creates. Only touches DNS records that point at this tunnel.
+- name: Delete cloudflared namespace
+  ansible.builtin.command: "{{ cluster_kubectl }} delete namespace {{ cloudflared_namespace }} --ignore-not-found --timeout=180s"
+  register: cloudflared_ns_delete
+  changed_when: cloudflared_ns_delete.stdout is search('deleted')
+
+- name: Delete tunnel DNS records
+  ansible.builtin.include_tasks: reset_dns_record.yaml
+  loop: "{{ cloudflare_public_hostnames }}"
+  loop_control:
+    loop_var: dns_hostname
+  when: cloudflare_tunnel_target | length > 0
+
+- name: Look up Access application
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps?domain={{ cloudflare_vault_hostname }}&exact=true"
+
+- name: Delete Access application
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: DELETE
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps/{{ access_app_item.id }}"
+  loop: "{{ cf_response.result | selectattr('domain', 'equalto', cloudflare_vault_hostname) | list }}"
+  loop_control:
+    loop_var: access_app_item
+    label: "{{ access_app_item.name }}"
+
+- name: List Access policies
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/policies?per_page=100"
+
+- name: Delete Access policy
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: DELETE
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/policies/{{ access_policy_item.id }}"
+  loop: "{{ cf_response.result | selectattr('name', 'equalto', cloudflare_access_policy_name) | list }}"
+  loop_control:
+    loop_var: access_policy_item
+    label: "{{ access_policy_item.name }}"
+
+# A tunnel supplied through tunnel_token was created by hand; only routes/DNS/Access are removed.
+- name: Delete tunnel
+  when:
+    - cloudflare_tunnel_id | length > 0
+    - cloudflare_pinned_tunnel_token | length == 0
+  block:
+    - name: Clean up stale tunnel connections
+      ansible.builtin.include_tasks: api.yaml
+      vars:
+        cf_method: DELETE
+        cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}/connections"
+
+    - name: Delete tunnel {{ cloudflare_tunnel_name }}
+      ansible.builtin.include_tasks: api.yaml
+      vars:
+        cf_method: DELETE
+        cf_path: "/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}"
