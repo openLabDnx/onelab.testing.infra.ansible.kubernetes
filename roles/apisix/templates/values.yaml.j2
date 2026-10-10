@@ -1,0 +1,124 @@
+# APISIX Helm values (Managed by Ansible)
+fullnameOverride: "{{ apisix_release_name }}"
+
+image:
+  tag: "{{ apisix_image_tag }}"
+
+# Equal to the HPA minimum (HPA managed by Ansible, see k8s-extras.yaml.j2).
+replicaCount: {{ apisix_hpa_min_replicas }}
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: apisix
+        app.kubernetes.io/instance: "{{ apisix_release_name }}"
+    # count only the current revision's pods during a rollout
+    matchLabelKeys:
+      - pod-template-hash
+resources:
+  {{ apisix_gateway_resources | to_nice_yaml(indent=2) | trim | indent(2) }}
+
+# Internal only: cloudflared reaches it in-cluster. A NodePort would publish
+# plain HTTP on every node's public IP.
+service:
+  type: ClusterIP
+  # the chart always renders this field; Kubernetes rejects it on ClusterIP services
+  externalTrafficPolicy: ""
+
+apisix:
+  # no "APISIX/<version>" in the Server header
+  enableServerTokens: false
+
+  admin:
+    enabled: true
+    # built-in Admin UI at :9180/ui/ (replaces the deprecated apisix-dashboard chart)
+    enable_admin_ui: true
+    type: ClusterIP
+    # keys come from the Secret as env vars, never from the chart's public defaults
+    credentials:
+      secretName: apisix-admin-credentials
+    allow:
+      ipList:
+{% if apisix_admin_via_cloudflared %}
+        # Behind cloudflared, remote_addr is the end user's IP (CF-Connecting-IP),
+        # so an IP allow-list cannot work here. Who can connect is enforced by the
+        # NetworkPolicy (cloudflared pods + port-forward only), Cloudflare Access
+        # in front of the hostname, and the admin key.
+        - 0.0.0.0/0
+        - "::/0"
+{% else %}
+        # reachable only through `kubectl port-forward` (make apisix-admin)
+        - 127.0.0.0/24
+{% endif %}
+
+  nginx:
+    http:
+      realIpHeader: "{{ apisix_real_ip_header }}"
+      realIpRecursive: "off"
+      realIpFrom:
+        - 127.0.0.1
+        - "unix:"
+        - "{{ apisix_pod_cidr }}"
+
+  # X-Forwarded-* from cloudflared (pod network) are honoured
+  trustedAddresses:
+    - 127.0.0.1
+    - "{{ apisix_pod_cidr }}"
+
+  # metrics on :9091 (service apisix-prometheus-metrics) for Prometheus
+  prometheus:
+    enabled: true
+
+etcd:
+  enabled: true
+  image:
+    registry: docker.io
+    repository: "{{ apisix_etcd_image_repository }}"
+    tag: "{{ apisix_etcd_image_tag }}"
+  replicaCount: {{ apisix_etcd_replicas }}
+  # never two members on one node: losing that node would take two votes
+  podAntiAffinityPreset: hard
+  persistence:
+    enabled: true
+    storageClass: "{{ apisix_etcd_storage_class }}"
+    size: "{{ apisix_etcd_size }}"
+  # no CPU limit: throttling can stall etcd heartbeats
+  resources:
+    {{ apisix_etcd_resources | to_nice_yaml(indent=2) | trim | indent(4) }}
+  auth:
+    token:
+      # pinned so a Helm upgrade does not regenerate it and restart every member
+      privateKey:
+        existingSecret: apisix-etcd-jwt
+  # chart PDB minAvailable 51% = 2 of 3: one member may be evicted at a time
+  pdb:
+    create: true
+  # etcd accepts clients only from the APISIX gateway pods, its peers and the
+  # chart's pre-upgrade hook job (runs on every helm upgrade)
+  networkPolicy:
+    enabled: true
+    allowExternal: false
+    extraIngress:
+      - from:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: apisix
+                app.kubernetes.io/instance: "{{ apisix_release_name }}"
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: etcd
+                app.kubernetes.io/instance: "{{ apisix_release_name }}"
+                app.kubernetes.io/component: etcd-pre-upgrade-job
+        ports:
+          - port: 2379
+            protocol: TCP
+
+ingress-controller:
+  enabled: false

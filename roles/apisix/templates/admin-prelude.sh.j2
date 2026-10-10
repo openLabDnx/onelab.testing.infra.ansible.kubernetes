@@ -1,0 +1,17 @@
+# Shared by the smoke-test and status scripts (run on the primary server).
+# The Admin API only accepts 127.0.0.0/24, so it is reached through a short-lived
+# port-forward; the admin key is read from the Secret into a 0600 curl config
+# file, never onto a command line.
+set -euo pipefail
+K="{{ apisix_kubectl }}"
+ADMIN="http://127.0.0.1:19180/apisix/admin"
+CURL_CFG="$(mktemp)"; PF_PID=""
+cleanup() { [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null; rm -f "$CURL_CFG"; }
+trap cleanup EXIT
+chmod 600 "$CURL_CFG"
+printf 'header = "X-API-KEY: %s"\n' \
+  "$($K get secret apisix-admin-credentials -o jsonpath="{.data.${ADMIN_ROLE:-admin}}" | base64 -d)" > "$CURL_CFG"
+$K port-forward svc/{{ apisix_release_name }}-admin 19180:9180 >/dev/null 2>&1 &
+PF_PID=$!
+for _ in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:19180/ui/ && break; sleep 0.5; done
+admin() { curl -sS -m 10 -K "$CURL_CFG" -H 'Content-Type: application/json' "$@"; }

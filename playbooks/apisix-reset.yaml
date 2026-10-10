@@ -1,0 +1,19 @@
+---
+- name: Destroy APISIX and every route, upstream and consumer stored in its etcd
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  vars_prompt:
+    - name: apisix_reset_confirm
+      prompt: "This deletes APISIX and all of its routes/consumers. Type 'destroy-apisix' to continue"
+      private: no
+  tasks:
+    - name: Abort unless confirmed
+      ansible.builtin.fail:
+        msg: "Confirmation not given, nothing was changed."
+      when: apisix_reset_confirm != 'destroy-apisix'
+
+    - name: Tear down APISIX
+      ansible.builtin.include_role:
+        name: apisix
+        tasks_from: reset.yaml

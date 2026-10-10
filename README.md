@@ -45,7 +45,12 @@ autofik.infra.testing/
 │   │   ├── defaults/main.yaml   # Versions, replicas, storage, UI exposure, key shares
 │   │   ├── tasks/
 │   │   └── templates/values.yaml.j2
-│   └── cloudflare_tunnel/       # Tunnel, routes, DNS, Access (Cloudflare API) + cloudflared
+│   ├── cloudflare_tunnel/       # Tunnel, routes, DNS, Access (Cloudflare API) + cloudflared
+│   ├── apisix/                  # APISIX gateway + etcd x3, Admin UI, PDB/HPA/NetworkPolicy, smoke test
+│   │   ├── defaults/main.yaml   # Chart/image pins, replicas, HPA, etcd, real-IP settings
+│   │   ├── tasks/
+│   │   └── templates/           # values.yaml.j2, k8s-extras.yaml.j2, smoke-test/status scripts
+│   └── helm/                    # Pinned Helm binary on the primary server (used by vault, apisix)
 │       ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
 │       ├── tasks/
 │       └── templates/cloudflared.yaml.j2
@@ -62,12 +67,16 @@ autofik.infra.testing/
 │   ├── 07-cloudflare.yaml       # Cloudflare Tunnel + DNS + Access + cloudflared
 │   ├── cloudflare-status.yaml   # Tunnel health, edge certificates, live probes
 │   ├── cloudflare-reset.yaml    # Delete tunnel, its DNS records, Access app (asks to confirm)
+│   ├── 08-apisix.yaml           # APISIX API gateway (HA) + smoke test
+│   ├── apisix-status.yaml       # Gateway/etcd pods, HPA, etcd health, route counts
+│   ├── apisix-reset.yaml        # Destroy APISIX and its etcd data (asks to confirm)
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
 │   ├── setup_ssh_keys.sh       # Key generator & key distribution helper
-│   └── vault_ui_tunnel.sh      # SSH + port-forward tunnel to the Vault UI
-├── secrets/                     # (git-ignored) Vault keys + TLS, Cloudflare API token
+│   ├── vault_ui_tunnel.sh      # SSH + port-forward tunnel to the Vault UI
+│   └── apisix_admin_tunnel.sh  # SSH + port-forward tunnel to the APISIX Admin API/UI
+├── secrets/                     # (git-ignored) Vault keys + TLS, Cloudflare tokens, APISIX admin keys
 ├── site.yaml                    # Master orchestration entrypoint
 ├── Makefile                     # Shortcut CLI commands
 └── README.md
@@ -212,6 +221,8 @@ The cluster is published through the Cloudflare Tunnel `f453e37b-…` (created i
 | Public hostname | Goes to | Protection |
 | :--- | :--- | :--- |
 | `vault.testing.autofik.com` | `vault-active` (HTTPS, verified with the Vault CA) | Cloudflare Access (`mai.reaksa@autofik.com`) + Vault login |
+| `apisix.testing.autofik.com/ui/` | APISIX Admin UI + Admin API (`apisix-admin:9180`) | Cloudflare Access (`mai.reaksa@autofik.com`) + APISIX admin key |
+| `api.testing.autofik.com` | APISIX (`apisix-gateway`) | APISIX plugins per route |
 | `*.testing.autofik.com` | Traefik (`rke2-traefik`), so any Ingress with that host | the app itself |
 | anything else | `404` | - |
 
@@ -235,6 +246,10 @@ Zero Trust must be enabled on the account, with the **One-time PIN** login metho
 make cloudflare             # routes, DNS, edge cert, Access, cloudflared, end-to-end probes (safe to re-run)
 make cloudflare-status      # tunnel health + connections, edge certificates, live probes
 make cloudflare-connector   # only (re)deploy cloudflared from the tunnel token, with no API calls
+```
+**Vault and the APISIX dashboard are published only behind Cloudflare Access.** If Access isn't usable (not enabled on the account, or the token lacks the permission), `make cloudflare` stops before changing anything. Until Access is enabled, publish everything except those two with:
+```bash
+ansible-playbook playbooks/07-cloudflare.yaml -e '{"cloudflare_vault_enabled": false, "cloudflare_apisix_admin_enabled": false}'
 ```
 Ansible owns this tunnel's routes, so any route you add in the dashboard is replaced on the next run. Add routes in `cloudflare_extra_routes` instead (`roles/cloudflare_tunnel/defaults/main.yaml`).
 
@@ -271,6 +286,65 @@ For CLI or automation, keep using `make vault-ui`, or create an Access **service
 ```bash
 make cloudflare-reset    # asks for confirmation; deletes the DNS records, Access app/policy and cloudflared
                          # (a tunnel supplied through tunnel_token is kept; a tunnel Ansible created is deleted)
+```
+
+---
+
+## 🚪 APISIX API Gateway
+
+Apache APISIX is the public API edge, set up the same way as the master cluster's `roles/apisix`: the **traditional** role with **etcd** as config store. Routes are written through the Admin API (e.g. the billing `seed-routes.sh`) or the built-in Admin UI, and survive pod restarts.
+
+```text
+client ──HTTPS──▶ Cloudflare edge ──tunnel──▶ cloudflared ──HTTP──▶ apisix-gateway ──▶ your services
+                  (TLS ends here)                                    (2-3 pods, HPA)
+                                                                           │ watches
+                                                                     apisix-etcd x3 (one per node)
+```
+
+| Item | Setting |
+| :--- | :--- |
+| Chart / APISIX | `apisix/apisix` `2.17.0` / APISIX `3.18.0`, the same pins as the master cluster |
+| Gateway | 2-3 pods (HPA on CPU 70%, scales by 1 at a time), spread across nodes, PDB `minAvailable: 1`, zero-downtime rolling updates |
+| Config store | etcd 3 members, one per node (hard anti-affinity), 8Gi each on `local-path-retain`, keeps working with 1 node down |
+| Public URLs | API: `https://api.testing.autofik.com` → `apisix-gateway:80`<br>Dashboard: `https://apisix.testing.autofik.com/ui/` → `apisix-admin:9180`, behind Cloudflare Access |
+| Client IP | `remote_addr` = `CF-Connecting-IP`, trusted only from the pod network, so `limit-count` / `ip-restriction` see the real user |
+| Admin API / UI | port 9180, ClusterIP; NetworkPolicy lets only the `cloudflared` pods in (plus `make apisix-admin` port-forward). Behind Cloudflare, `remote_addr` is the visitor's IP, so the nginx IP allow-list is open and protection is NetworkPolicy + Cloudflare Access + admin key (`apisix_admin_via_cloudflared: false` restores localhost-only) |
+| Keys | generated admin/viewer keys in `secrets/apisix/` (git-ignored), served from a Secret; the chart's public default key returns 401 |
+| Isolation | etcd accepts clients only from gateway pods; other pods can reach only the proxy (9080) and metrics (9091) |
+| Metrics | Prometheus on `apisix-prometheus-metrics.apisix.svc:9091/apisix/prometheus/metrics` |
+
+### Deploy
+```bash
+make apisix          # storage + APISIX + etcd + PDB/HPA/NetworkPolicy + smoke test (safe to re-run)
+make apisix-status   # pods, HPA, etcd health, number of routes/upstreams/consumers
+```
+`make apisix` ends with a smoke test. It creates a temporary route through the Admin API, checks that every gateway pod serves it and that the client IP is read from `CF-Connecting-IP`, then deletes the route.
+
+### Add routes
+Open the dashboard at **https://apisix.testing.autofik.com/ui/**: sign in with Cloudflare Access, then enter the admin key from `secrets/apisix/admin_key`. Or use the private tunnel:
+```bash
+make apisix-admin    # keep it open; Admin UI at http://127.0.0.1:9180/ui/ (log in with the admin key)
+
+export APISIX_ADMIN_URL=http://127.0.0.1:9180
+export APISIX_ADMIN_KEY=$(cat secrets/apisix/admin_key)
+curl -sS -X PUT "$APISIX_ADMIN_URL/apisix/admin/routes/hello" -H "X-API-KEY: $APISIX_ADMIN_KEY" -d '{
+  "uri": "/api/v1/hello/*",
+  "upstream": { "type": "roundrobin", "nodes": { "my-service.my-namespace.svc.cluster.local:8080": 1 } },
+  "plugins": { "limit-count": { "count": 120, "time_window": 60, "key_type": "var", "key": "remote_addr", "rejected_code": 429 } }
+}'
+```
+The existing scripts work through the same tunnel, e.g. `deployment/autofik.api.dev.getway.internal.billing/apisix/seed-routes.sh` (set `UPSTREAM_NODE` to the service in this cluster).
+
+### Operations
+- **Rotate the admin key:** delete `secrets/apisix/admin_key` and run `make apisix`. A new key is generated and the gateway restarts with it.
+- **Upgrade:** bump `apisix_chart_version` / `apisix_image_tag` in `roles/apisix/defaults/main.yaml`, then `make apisix` (rolling, no downtime).
+- **Grow etcd:** only one member per run (2→3, then 3→4); see the master repo's `roles/apisix` for why.
+- **Backup:** routes live only in etcd. Take a snapshot before risky changes:
+  `kubectl -n apisix exec apisix-etcd-0 -- etcdctl snapshot save /tmp/apisix.db` then `kubectl cp` it out.
+
+### Destroy
+```bash
+make apisix-reset    # asks for confirmation; deletes APISIX, etcd and every route/consumer (keys in secrets/apisix are kept)
 ```
 
 ---

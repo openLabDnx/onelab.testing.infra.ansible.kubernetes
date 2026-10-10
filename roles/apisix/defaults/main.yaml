@@ -1,0 +1,65 @@
+---
+# Defaults for apisix role
+# Apache APISIX API gateway, same model as the master cluster's roles/apisix:
+# traditional role with etcd as config provider, so routes are written through
+# the Admin API (seed scripts) or the built-in Admin UI.
+
+apisix_namespace: "apisix"
+apisix_release_name: "apisix"
+apisix_chart_repo_url: "https://charts.apiseven.com"
+apisix_chart_version: "2.17.0"        # APISIX 3.18.0, same pin as the master cluster
+apisix_image_tag: "3.18.0-ubuntu"
+
+# Gateway pods (stateless: routes live in etcd). replicaCount equals the HPA
+# minimum, so a Helm re-run only ever resets the count to that minimum.
+apisix_hpa_min_replicas: 2
+apisix_hpa_max_replicas: 3
+apisix_hpa_cpu_target: 70             # % of the CPU request
+apisix_gateway_resources:
+  requests:
+    cpu: "50m"
+    memory: "192Mi"
+  limits:
+    memory: "512Mi"
+
+# APISIX's own etcd: one member per node (hard anti-affinity), so a majority
+# survives losing any node. A fresh install bootstraps all members at once;
+# growing an existing cluster must go one member per run (see master roles/apisix).
+apisix_etcd_replicas: 3
+# bitnamilegacy images are frozen (no more CVE fixes); 3.6.4 is the release the
+# bundled etcd subchart (12.0.18) targets.
+apisix_etcd_image_repository: "bitnamilegacy/etcd"
+apisix_etcd_image_tag: "3.6.4-debian-12-r4"
+apisix_etcd_storage_class: "local-path-retain"
+apisix_etcd_size: "8Gi"
+apisix_etcd_resources:
+  requests:
+    cpu: "50m"
+    memory: "128Mi"
+  limits:
+    memory: "512Mi"
+
+# Traffic only reaches APISIX through cloudflared (pod network). Cloudflare puts
+# the real client address in CF-Connecting-IP; trust it only from pod IPs, so
+# remote_addr (limit-count keys, logs, ip-restriction) is the end user.
+apisix_pod_cidr: "10.42.0.0/16"
+apisix_real_ip_header: "CF-Connecting-IP"
+
+# Public hostnames (routes added to the Cloudflare tunnel by roles/cloudflare_tunnel)
+apisix_public_hostname: "api.testing.autofik.com"
+apisix_admin_public_hostname: "apisix.testing.autofik.com"
+
+# Let cloudflared reach the Admin API + UI so it can be published at
+# apisix_admin_public_hostname behind Cloudflare Access. The NetworkPolicy then
+# opens port 9180 to the cloudflared pods only; every other pod stays blocked.
+apisix_admin_via_cloudflared: true
+apisix_cloudflared_namespace: "cloudflared"
+
+# Local (controller) secrets, git-ignored
+apisix_local_secrets_dir: "{{ inventory_dir }}/../secrets/apisix"
+
+rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"
+apisix_kubectl: "{{ cluster_kubectl }} -n {{ apisix_namespace }}"
+apisix_gateway_selector: "app.kubernetes.io/name=apisix,app.kubernetes.io/instance={{ apisix_release_name }}"
+apisix_etcd_selector: "app.kubernetes.io/name=etcd,app.kubernetes.io/instance={{ apisix_release_name }}"

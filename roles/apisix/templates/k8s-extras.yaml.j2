@@ -1,0 +1,84 @@
+# APISIX gateway PDB, HPA and NetworkPolicy (Managed by Ansible)
+# Own PDB rather than the chart's (minAvailable 90% blocks every eviction at 2 replicas).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apisix-gateway
+  namespace: {{ apisix_namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apisix
+      app.kubernetes.io/instance: "{{ apisix_release_name }}"
+---
+# HPA here rather than in the chart: the chart's template has no `behavior` block.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ apisix_release_name }}
+  namespace: {{ apisix_namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ apisix_release_name }}
+  minReplicas: {{ apisix_hpa_min_replicas }}
+  maxReplicas: {{ apisix_hpa_max_replicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ apisix_hpa_cpu_target }}
+  behavior:
+    # at most one pod per minute, after a minute of sustained load
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    # at most one pod per two minutes, after five quiet minutes
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+# Gateway pods: proxy (9080) and metrics (9091) are open to the cluster.
+# Admin API (9180) is open only to cloudflared (when published behind Access);
+# the control API (9090) gets no network access. `kubectl port-forward` still
+# works because it enters the pod via localhost.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: apisix-gateway
+  namespace: {{ apisix_namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: apisix
+      app.kubernetes.io/instance: "{{ apisix_release_name }}"
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 9080
+          protocol: TCP
+        - port: 9091
+          protocol: TCP
+{% if apisix_admin_via_cloudflared %}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ apisix_cloudflared_namespace }}
+          podSelector:
+            matchLabels:
+              app: cloudflared
+      ports:
+        - port: 9180
+          protocol: TCP
+{% endif %}

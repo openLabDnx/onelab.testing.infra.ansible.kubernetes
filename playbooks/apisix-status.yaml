@@ -1,0 +1,10 @@
+---
+- name: Show APISIX gateway status
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Show APISIX status
+      ansible.builtin.include_role:
+        name: apisix
+        tasks_from: status.yaml

@@ -1,0 +1,39 @@
+---
+# Deletes APISIX, its etcd and every route/consumer stored in it. Local keys in
+# secrets/apisix are kept and reused by the next install.
+- name: Uninstall APISIX Helm release
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: "{{ apisix_release_name }}"
+    release_namespace: "{{ apisix_namespace }}"
+    state: absent
+    wait: true
+
+- name: Find etcd persistent volumes
+  ansible.builtin.command: >
+    {{ apisix_kubectl }} get pvc -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}'
+  register: apisix_pvs
+  changed_when: false
+  failed_when: false
+
+# Volumes use reclaimPolicy Retain; switch to Delete so local-path-provisioner wipes the data dirs.
+- name: Switch etcd volumes to reclaimPolicy Delete
+  ansible.builtin.command: >
+    {{ cluster_kubectl }} patch pv {{ item }}
+    -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+  loop: "{{ apisix_pvs.stdout_lines | select | list }}"
+
+- name: Delete APISIX namespace (PVCs, Secrets, PDB, HPA, NetworkPolicies)
+  ansible.builtin.command: "{{ cluster_kubectl }} delete namespace {{ apisix_namespace }} --ignore-not-found --timeout=300s"
+  register: apisix_ns_delete
+  changed_when: apisix_ns_delete.stdout is search('deleted')
+
+- name: Wait for etcd volumes to be removed
+  ansible.builtin.command: "{{ cluster_kubectl }} get pv {{ item }} --ignore-not-found -o name"
+  loop: "{{ apisix_pvs.stdout_lines | select | list }}"
+  register: apisix_pv_gone
+  until: apisix_pv_gone.stdout | length == 0
+  retries: 30
+  delay: 5
+  changed_when: false

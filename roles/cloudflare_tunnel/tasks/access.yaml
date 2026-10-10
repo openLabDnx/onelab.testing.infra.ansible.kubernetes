@@ -51,47 +51,16 @@
   ansible.builtin.set_fact:
     access_policy_id: "{{ access_policy.id if access_policy | length > 0 else cf_response.result.id }}"
 
-# --- application ------------------------------------------------------------
-- name: Look up Access application for {{ cloudflare_vault_hostname }}
-  ansible.builtin.include_tasks: api.yaml
-  vars:
-    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps?domain={{ cloudflare_vault_hostname }}&exact=true"
-
-- name: Find Access application
-  ansible.builtin.set_fact:
-    access_app: "{{ cf_response.result | selectattr('domain', 'equalto', cloudflare_vault_hostname) | first | default({}) }}"
-    access_app_body:
-      name: "{{ cloudflare_access_app_name }}"
-      domain: "{{ cloudflare_vault_hostname }}"
-      type: self_hosted
-      session_duration: "{{ cloudflare_access_session_duration }}"
-      app_launcher_visible: true
-      policies:
-        - id: "{{ access_policy_id }}"
-          precedence: 1
-
-- name: Create Access application
-  ansible.builtin.include_tasks: api.yaml
-  vars:
-    cf_method: POST
-    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps"
-    cf_body: "{{ access_app_body }}"
-  when: access_app | length == 0
-
-- name: Update Access application when it drifted
-  ansible.builtin.include_tasks: api.yaml
-  vars:
-    cf_method: PUT
-    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps/{{ access_app.id }}"
-    cf_body: "{{ access_app_body }}"
-  when:
-    - access_app | length > 0
-    - access_app.name != cloudflare_access_app_name
-      or access_app.session_duration | default('') != cloudflare_access_session_duration
-      or (access_app.policies | default([]) | map(attribute='id') | list) != [access_policy_id]
+# --- applications (one per protected hostname, all sharing the policy) ---
+- name: Ensure Access application per protected hostname
+  ansible.builtin.include_tasks: access_app.yaml
+  loop: "{{ cloudflare_access_protected }}"
+  loop_control:
+    loop_var: access_target
+    label: "{{ access_target.hostname }}"
 
 - name: Display Access protection
   ansible.builtin.debug:
     msg: >-
-      https://{{ cloudflare_vault_hostname }} is behind Cloudflare Access, allowed:
-      {{ (cloudflare_access_allowed_email_domains | map('regex_replace', '^', '@') | list) + cloudflare_access_allowed_emails }}
+      Behind Cloudflare Access: {{ cloudflare_access_protected | map(attribute='hostname') | join(', ') }};
+      allowed: {{ (cloudflare_access_allowed_email_domains | map('regex_replace', '^', '@') | list) + cloudflare_access_allowed_emails }}

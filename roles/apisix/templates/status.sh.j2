@@ -1,0 +1,15 @@
+{% include 'admin-prelude.sh.j2' %}
+
+echo "== gateway and etcd pods"
+$K get pods -o wide -L app.kubernetes.io/name | awk '{print $1, $2, $3, $5, $7}' | column -t
+echo
+echo "== autoscaler"
+$K get hpa {{ apisix_release_name }} -o jsonpath='replicas {.status.currentReplicas} (min {.spec.minReplicas}, max {.spec.maxReplicas}), cpu {.status.currentMetrics[0].resource.current.averageUtilization}% of request (target {.spec.metrics[0].resource.target.averageUtilization}%){"\n"}'
+echo
+echo "== etcd"
+$K exec {{ apisix_release_name }}-etcd-0 -c etcd -- etcdctl endpoint health --cluster 2>&1 | grep -v '//{{ apisix_release_name }}-etcd\.' | sed 's/^/  /'
+echo
+echo "== configuration in etcd (read with the viewer key)"
+for kind in routes services upstreams consumers ssls global_rules plugin_configs; do
+  printf '  %-15s %s\n' "$kind" "$(admin "$ADMIN/$kind" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("total", "?"))')"
+done

@@ -1,0 +1,25 @@
+---
+- name: Smoke-test routing, config sync and client IP
+  ansible.builtin.command:
+    cmd: bash -s
+    stdin: "{{ lookup('ansible.builtin.template', 'smoke-test.sh.j2') }}"
+  register: apisix_smoke
+  changed_when: false
+  failed_when: false
+
+- name: Display smoke-test results
+  ansible.builtin.debug:
+    msg: "{{ apisix_smoke.stdout_lines + apisix_smoke.stderr_lines }}"
+
+- name: Fail when the smoke test failed
+  ansible.builtin.fail:
+    msg: "APISIX smoke test failed, see the FAIL lines above."
+  when: apisix_smoke.rc != 0
+
+- name: Display access instructions
+  ansible.builtin.debug:
+    msg:
+      - "In-cluster gateway:  http://{{ apisix_release_name }}-gateway.{{ apisix_namespace }}.svc.cluster.local"
+      - "Public (Cloudflare): https://{{ apisix_public_hostname }} (route in roles/cloudflare_tunnel)"
+      - "Admin UI / API:      make apisix-admin, then http://127.0.0.1:9180/ui/ (key: {{ apisix_local_secrets_dir }}/admin_key)"
+      - "{{ ('Admin UI public:     https://' ~ apisix_admin_public_hostname ~ '/ui/ (behind Cloudflare Access, roles/cloudflare_tunnel)') if apisix_admin_via_cloudflared else 'Admin UI public:     disabled' }}"

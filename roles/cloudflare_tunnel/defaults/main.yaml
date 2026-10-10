@@ -27,6 +27,12 @@ cloudflare_vault_hostname: "vault.{{ cloudflare_base_domain }}"
 cloudflare_vault_origin: "https://vault-active.vault.svc.cluster.local:8200"
 cloudflare_vault_ca_file: "{{ inventory_dir }}/../secrets/vault/tls/ca.crt"
 
+# APISIX Admin API + built-in UI (roles/apisix), behind Cloudflare Access.
+# The UI lives under /ui/ (https://apisix.testing.autofik.com/ui/).
+cloudflare_apisix_admin_enabled: true
+cloudflare_apisix_admin_hostname: "apisix.{{ cloudflare_base_domain }}"
+cloudflare_apisix_admin_origin: "http://apisix-admin.apisix.svc.cluster.local:9180"
+
 # Every other *.testing.autofik.com host goes to Traefik, so a new app only needs
 # an Ingress with its host; no Cloudflare change.
 cloudflare_wildcard_to_traefik: true
@@ -41,13 +47,17 @@ cloudflare_dns_replace_node_records: true
 # hostnames (Universal SSL stops at *.autofik.com). Requires ACM on the zone.
 cloudflare_order_edge_certificate: true
 
-# Extra rules placed before the wildcard, e.g.
-#   - { hostname: "grafana.testing.autofik.com", service: "http://grafana.monitoring.svc:3000" }
-cloudflare_extra_routes: []
+# Extra rules placed before the wildcard (each also gets a DNS record).
+cloudflare_extra_routes:
+  # APISIX API gateway (roles/apisix); TLS ends at Cloudflare, APISIX gets the client IP from CF-Connecting-IP
+  - hostname: "api.{{ cloudflare_base_domain }}"
+    service: "http://apisix-gateway.apisix.svc.cluster.local:80"
 
-# Cloudflare Access in front of the Vault UI (on top of Vault's own login)
+# Cloudflare Access in front of the admin UIs (on top of their own logins).
+# One reusable policy is shared by every protected app.
 cloudflare_access_app_name: "Vault (autofik testing)"
-cloudflare_access_policy_name: "Vault testing - allowed users"
+cloudflare_apisix_admin_app_name: "APISIX Admin (autofik testing)"
+cloudflare_access_policy_name: "autofik testing - allowed users"
 cloudflare_access_session_duration: "24h"
 cloudflare_access_allowed_email_domains: []
 cloudflare_access_allowed_emails:

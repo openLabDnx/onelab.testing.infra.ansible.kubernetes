@@ -74,19 +74,25 @@
   when: not (cf_response.success | default(false))
 
 # End-to-end probes from this machine through Cloudflare's edge.
-- name: Probe Vault hostname (expect a Cloudflare Access login redirect)
+- name: Reset probe summary
+  ansible.builtin.set_fact:
+    cloudflare_probe_lines: []
+
+- name: Probe admin UIs (expect a Cloudflare Access login redirect)
   ansible.builtin.uri:
-    url: "https://{{ cloudflare_vault_hostname }}/ui/"
+    url: "https://{{ item.hostname }}/"
     follow_redirects: none
-    status_code: [200, 302, 401, 403]
-  register: cloudflare_probe_vault
-  until: cloudflare_probe_vault.status in [200, 302, 401, 403]
+    status_code: [200, 302, 401, 403, 404]
+  register: cloudflare_probe_protected
+  until: cloudflare_probe_protected.status in [200, 302, 401, 403, 404]
   retries: "{{ cloudflare_probe_retries }}"
   delay: 10
   failed_when: false
+  loop: "{{ cloudflare_access_protected }}"
+  loop_control:
+    label: "{{ item.hostname }}"
   delegate_to: localhost
   become: false
-  when: cloudflare_vault_enabled
 
 - name: Probe wildcard hostname (expect Traefik 404 for an unknown app)
   ansible.builtin.uri:
@@ -102,17 +108,25 @@
   become: false
   when: cloudflare_wildcard_to_traefik
 
+- name: Summarise admin UI probes
+  ansible.builtin.set_fact:
+    cloudflare_probe_lines: "{{ cloudflare_probe_lines + [item.item.hostname ~ ': ' ~ verdict] }}"
+  vars:
+    verdict: >-
+      {{ 'OK - Cloudflare Access login'
+         if item.status | default(-1) == 302 and 'cloudflareaccess.com' in item.location | default('')
+         else ('NOT behind Access (HTTP ' ~ item.status ~ ') - check the Access application'
+               if item.status | default(-1) in [200, 401, 403, 404]
+               else 'FAILED (HTTP ' ~ item.status | default('?') ~ ' ' ~ item.msg | default('') | truncate(120) ~ ')') }}
+  loop: "{{ cloudflare_probe_protected.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.hostname }}"
+
 - name: Display probe results
   ansible.builtin.debug:
-    msg:
-      - >-
-        {{ cloudflare_vault_hostname }}:
-        {% if not cloudflare_vault_enabled %}disabled
-        {% elif cloudflare_probe_vault.status == 302 and 'cloudflareaccess.com' in cloudflare_probe_vault.location | default('') %}OK - redirected to Cloudflare Access login
-        {% elif cloudflare_probe_vault.status == 200 %}reachable WITHOUT Access - check the Access application
-        {% else %}FAILED - {{ cloudflare_probe_vault.status }} {{ cloudflare_probe_vault.msg | default('') | truncate(200) }}{% endif %}
-      - >-
-        *.{{ cloudflare_base_domain }}:
-        {% if not cloudflare_wildcard_to_traefik %}disabled
-        {% elif cloudflare_probe_wildcard.status == 404 %}OK - reached Traefik (404 for an unknown host)
-        {% else %}FAILED - {{ cloudflare_probe_wildcard.status }} {{ cloudflare_probe_wildcard.msg | default('') | truncate(200) }}{% endif %}
+    msg: >-
+      {{ cloudflare_probe_lines
+         + ['*.' ~ cloudflare_base_domain ~ ': '
+            ~ ('disabled' if not cloudflare_wildcard_to_traefik
+               else ('OK - reached Traefik (404 for an unknown host)' if cloudflare_probe_wildcard.status == 404
+                     else 'FAILED - ' ~ cloudflare_probe_wildcard.status ~ ' ' ~ cloudflare_probe_wildcard.msg | default('') | truncate(120)))] }}

@@ -45,10 +45,6 @@ vault_local_secrets_dir: "{{ inventory_dir }}/../secrets/vault"
 vault_local_tls_dir: "{{ vault_local_secrets_dir }}/tls"
 vault_init_file: "{{ vault_local_secrets_dir }}/vault-init.json"
 
-# Helm binary installed on the primary server node
-helm_version: "v3.22.0"
-helm_binary_path: "/usr/local/bin/helm"
-
 rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
 cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"
 vault_kubectl: "{{ cluster_kubectl }} -n {{ vault_namespace }}"

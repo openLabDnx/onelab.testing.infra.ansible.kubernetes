@@ -1,0 +1,5 @@
+---
+# Defaults for helm role
+# Helm binary installed on the primary server node; used by the vault and apisix roles.
+helm_version: "v3.22.0"
+helm_binary_path: "/usr/local/bin/helm"
