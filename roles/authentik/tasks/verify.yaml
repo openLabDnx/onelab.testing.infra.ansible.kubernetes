@@ -1,0 +1,36 @@
+---
+- name: authentik is reachable through Cloudflare
+  ansible.builtin.uri:
+    url: "https://{{ authentik_host }}/-/health/ready/"
+    status_code: [200, 204]
+  register: authentik_health
+  until: authentik_health.status in [200, 204]
+  retries: 12
+  delay: 10
+  delegate_to: localhost
+  become: false
+
+- name: OIDC discovery advertises the public https issuer
+  ansible.builtin.uri:
+    url: "https://{{ authentik_host }}/application/o/{{ item }}/.well-known/openid-configuration"
+    return_content: true
+  register: authentik_discovery
+  failed_when: authentik_discovery.json.issuer != 'https://' ~ authentik_host ~ '/application/o/' ~ item ~ '/'
+  loop: [argocd, portainer]
+  delegate_to: localhost
+  become: false
+
+- name: Show PostgreSQL cluster
+  ansible.builtin.command: >
+    {{ authentik_kubectl }} get cluster {{ authentik_db_cluster }}
+    -o jsonpath='{.status.readyInstances}/{.spec.instances} ready, primary {.status.currentPrimary}, phase {.status.phase}'
+  register: authentik_db_status
+  changed_when: false
+
+- name: Display authentik summary
+  ansible.builtin.debug:
+    msg:
+      - "authentik:  https://{{ authentik_host }}/  (akadmin, password in {{ platform_secrets_dir }}/authentik_akadmin_password)"
+      - "database:   {{ authentik_db_status.stdout }}"
+      - "backups:    CronJob authentik-db-backup ({{ authentik_backup_schedule }} UTC, {{ authentik_backup_retention_days }} days) on PVC authentik-db-backups"
+      - "admins:     members of the '{{ platform_admin_group }}' group get into Argo CD, Portainer and the Traefik dashboard"

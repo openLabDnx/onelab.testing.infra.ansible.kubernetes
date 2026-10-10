@@ -1,0 +1,74 @@
+# Argo CD Helm values (Managed by Ansible). No credentials in here: argocd-secret
+# and the OIDC client secret are Secrets created by the role.
+global:
+  domain: {{ argocd_host }}
+  # Argo CD components on the primary site (next to the API server).
+  # redis-ha is a subchart and keeps one Redis per node for Sentinel quorum.
+  nodeSelector:
+    {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
+
+configs:
+  secret:
+    createSecret: false
+  params:
+    server.insecure: true        # plain HTTP behind Traefik; TLS ends at Cloudflare
+  cm:
+    url: https://{{ argocd_host }}
+    admin.enabled: "{{ argocd_admin_enabled | string | lower }}"
+    users.anonymous.enabled: "false"
+    oidc.config: |
+      name: authentik
+      issuer: https://{{ authentik_host }}/application/o/argocd/
+      clientID: {{ argocd_oidc_client_id }}
+      clientSecret: $argocd-oidc-authentik:clientSecret
+      requestedScopes: ["openid", "profile", "email"]
+      logoutURL: https://{{ authentik_host }}/application/o/argocd/end-session/
+  rbac:
+    # nobody gets anything unless a rule below says so
+    policy.default: ""
+    scopes: "[groups]"
+    policy.csv: |
+      g, {{ platform_admin_group }}, role:admin
+
+dex:
+  enabled: false
+
+# Redis HA (3 Redis + Sentinel, 3 HAProxy; one per node)
+redis-ha:
+  enabled: true
+
+controller:
+  replicas: 1
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 2Gi }
+
+server:
+  replicas: {{ argocd_server_replicas }}
+  pdb:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 512Mi }
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+
+repoServer:
+  replicas: {{ argocd_repo_server_replicas }}
+  pdb:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+applicationSet:
+  replicas: {{ argocd_appset_replicas }}
+  pdb:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { memory: 256Mi }

@@ -1,0 +1,21 @@
+---
+- name: Portainer offers authentik SSO through Cloudflare
+  ansible.builtin.uri:
+    url: "https://{{ portainer_host }}/api/settings/public"
+    return_content: true
+  register: portainer_public
+  until: >-
+    portainer_public.status == 200
+    and portainer_public.json.AuthenticationMethod == 3
+    and portainer_public.json.OAuthLoginURI is search('^https://' ~ authentik_host ~ '/application/o/authorize/')
+  retries: 12
+  delay: 10
+  delegate_to: localhost
+  become: false
+
+- name: Display Portainer summary
+  ansible.builtin.debug:
+    msg:
+      - "Portainer:  https://{{ portainer_host }}/  -> 'Login with OAuth' (authentik, group {{ platform_admin_group }})"
+      - "SSO users land in team '{{ portainer_sso_team }}' with no environment access until an admin grants it"
+      - "break-glass: admin / {{ platform_secrets_dir }}/portainer_admin_password"

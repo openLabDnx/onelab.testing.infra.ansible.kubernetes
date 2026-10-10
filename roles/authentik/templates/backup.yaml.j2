@@ -1,0 +1,65 @@
+# Daily logical backup of the authentik database (Managed by Ansible)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: authentik-db-backups
+  namespace: {{ authentik_namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ authentik_db_storage_class }}
+  resources:
+    requests:
+      storage: {{ authentik_backup_size }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: authentik-db-backup
+  namespace: {{ authentik_namespace }}
+spec:
+  schedule: "{{ authentik_backup_schedule }}"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          nodeSelector:
+            {{ platform_primary_site_selector | to_nice_yaml | trim | indent(12) }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 26
+            fsGroup: 26
+          containers:
+            - name: pg-dump
+              image: {{ authentik_db_image }}
+              env:
+                - name: PGHOST
+                  value: {{ authentik_db_cluster }}-r     # read from a standby when there is one
+                - name: PGDATABASE
+                  value: authentik
+                - name: PGUSER
+                  valueFrom: { secretKeyRef: { name: authentik-db-app, key: username } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: authentik-db-app, key: password } }
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  f="/backups/authentik-$(date -u +%Y%m%dT%H%M%SZ).dump"
+                  pg_dump --format=custom --file="$f.tmp"
+                  mv "$f.tmp" "$f"
+                  find /backups -name 'authentik-*.dump' -mtime +{{ authentik_backup_retention_days }} -delete
+                  ls -lh /backups
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { memory: 512Mi }
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: authentik-db-backups

@@ -50,7 +50,13 @@ autofik.infra.testing/
 │   │   ├── defaults/main.yaml   # Chart/image pins, replicas, HPA, etcd, real-IP settings
 │   │   ├── tasks/
 │   │   └── templates/           # values.yaml.j2, k8s-extras.yaml.j2, smoke-test/status scripts
-│   └── helm/                    # Pinned Helm binary on the primary server (used by vault, apisix)
+│   ├── helm/                    # Pinned Helm binary on the primary server (used by vault, apisix, platform)
+│   ├── platform_vars/           # Shared hostnames, namespaces, node sites, OIDC client secrets
+│   ├── traefik/                 # RKE2 Traefik HelmChartConfig (no hostPorts) + dashboard behind SSO
+│   ├── cnpg/                    # CloudNativePG operator
+│   ├── authentik/               # PostgreSQL cluster, authentik, SSO blueprint, forward-auth, backups
+│   ├── argocd/                  # Argo CD HA + authentik OIDC
+│   └── portainer/               # Portainer CE + authentik OAuth
 │       ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
 │       ├── tasks/
 │       └── templates/cloudflared.yaml.j2
@@ -70,6 +76,7 @@ autofik.infra.testing/
 │   ├── 08-apisix.yaml           # APISIX API gateway (HA) + smoke test
 │   ├── apisix-status.yaml       # Gateway/etcd pods, HPA, etcd health, route counts
 │   ├── apisix-reset.yaml        # Destroy APISIX and its etcd data (asks to confirm)
+│   ├── 09-platform.yaml         # Traefik, CloudNativePG, authentik, Argo CD, Portainer (tags per part)
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
@@ -346,6 +353,45 @@ The existing scripts work through the same tunnel, e.g. `deployment/autofik.api.
 ```bash
 make apisix-reset    # asks for confirmation; deletes APISIX, etcd and every route/consumer (keys in secrets/apisix are kept)
 ```
+
+---
+
+## 🧭 Platform: Traefik, authentik (SSO), Argo CD, Portainer
+
+Every UI is published under `*.testing.autofik.com`. The Cloudflare tunnel already sends that wildcard to Traefik, so no Cloudflare change is needed. **authentik is the single login** for everything else.
+
+| URL | What | Login |
+| :--- | :--- | :--- |
+| https://auth.testing.autofik.com | authentik (SSO, users, groups, MFA) | `akadmin` / `secrets/platform/authentik_akadmin_password` |
+| https://argocd.testing.autofik.com | Argo CD (GitOps) | **Log in via authentik**; break-glass `admin` / `secrets/platform/argocd_admin_password` |
+| https://portainer.testing.autofik.com | Portainer CE | **Login with OAuth** (authentik); break-glass `admin` / `secrets/platform/portainer_admin_password` |
+| https://traefik.testing.autofik.com/dashboard/ | Traefik dashboard | authentik forward-auth (no login of its own) |
+
+Only members of the authentik group **`platform-admins`** can open these apps (`akadmin` is in it); anyone else gets authentik's "Permission denied". Argo CD maps that group to `role:admin`. In Portainer, SSO users land in team `sso-users` **with no environment access**; usernames listed in `portainer_admin_users` (`roles/portainer/defaults/main.yaml`, default `akadmin`) are made Portainer administrators after their first SSO login and a re-run of `make portainer`.
+
+```bash
+make platform    # everything below, in order (safe to re-run)
+make traefik     # Traefik settings + dashboard
+make authentik   # PostgreSQL + authentik + SSO blueprint + backups
+make argocd      # Argo CD HA + SSO
+make portainer   # Portainer + SSO
+```
+
+### What "production" means here
+- **Traefik:** RKE2's bundled Traefik, tuned through a `HelmChartConfig`. **No hostPorts**: the nodes' public IPs no longer answer on 80/443, so traffic can't get around Cloudflare. Client IP and `X-Forwarded-*` headers are trusted only from the pod network (cloudflared). JSON access logs. The dashboard is behind authentik.
+- **authentik:** 2 server + 2 worker pods with PDBs. All settings and credentials come from a Secret (no inline env passwords, no superuser API token). SSO apps, groups and forward-auth providers are declared in a **blueprint** (`roles/authentik/templates/platform-blueprint.yaml.j2`); change them there, not by hand.
+- **PostgreSQL for authentik:** CloudNativePG (operator ×2), 2 instances (primary + synchronous standby) with automatic failover. **Daily `pg_dump`** at 02:30 UTC to the PVC `authentik-db-backups`, kept 14 days.
+- **Argo CD:** HA (2 server, 2 repo-server, 2 ApplicationSet, Redis HA with Sentinel). OIDC with authentik plus RBAC (`policy.default` = nothing). The admin password hash is kept, so re-runs don't log anyone out.
+- **Portainer:** CE 2.45.1, data on `local-path-retain`, **database encrypted at rest**, SSO through authentik, trusted origin set for the proxy.
+
+### Node sites
+master and worker2 share a data centre (~1 ms). **worker1 is ~160 ms away.** Nodes are labelled `autofik.com/site=eu|ap`. authentik, its PostgreSQL, Argo CD and Portainer run only on `eu`: a database client 160 ms from its database spends seconds per request.
+
+### After the first deploy
+1. Log in to https://auth.testing.autofik.com as `akadmin`, create your own user, add it to `platform-admins`, and **enable MFA** (Settings → MFA devices). For Portainer admin rights, add your username to `portainer_admin_users`, log in to Portainer once via OAuth, then run `make portainer`.
+2. Check SSO into Argo CD, then set `argocd_admin_enabled: false` in `roles/argocd/defaults/main.yaml` and run `make argocd`.
+3. Copy the latest authentik backup off the cluster from time to time:
+   `kubectl -n authentik exec <pod with the PVC> -- ls /backups` (or restore with `pg_restore`).
 
 ---
 

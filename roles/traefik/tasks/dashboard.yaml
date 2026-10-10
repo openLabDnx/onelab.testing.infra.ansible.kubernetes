@@ -1,0 +1,7 @@
+---
+- name: Publish Traefik dashboard behind authentik
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'dashboard.yaml.j2') }}"
+  register: traefik_dashboard_apply
+  changed_when: traefik_dashboard_apply.stdout is search('(created|configured)')

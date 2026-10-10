@@ -1,0 +1,37 @@
+# RKE2 bundled Traefik overrides (Managed by Ansible)
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      # No hostPorts: the nodes' public IPs no longer answer on 80/443, so
+      # nobody can reach the apps around Cloudflare. Traffic arrives only
+      # through the tunnel (cloudflared -> rke2-traefik Service).
+      web:
+        hostPort: null
+        forwardedHeaders:
+          trustedIPs: {{ traefik_trusted_ips | to_json }}
+      websecure:
+        hostPort: null
+        forwardedHeaders:
+          trustedIPs: {{ traefik_trusted_ips | to_json }}
+    providers:
+      kubernetesCRD:
+        # lets IngressRoutes use the authentik forward-auth middleware/service
+        allowCrossNamespace: true
+    logs:
+      access:
+        enabled: true
+        format: json
+        fields:
+          headers:
+            defaultmode: drop
+            names:
+              User-Agent: keep
+              Cf-Connecting-Ip: keep
+              Cf-Ray: keep
+    resources:
+      {{ traefik_resources | to_nice_yaml(indent=2) | trim | indent(6) }}

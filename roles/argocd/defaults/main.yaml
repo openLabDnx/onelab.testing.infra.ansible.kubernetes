@@ -1,0 +1,11 @@
+---
+# Defaults for argocd role
+argocd_chart_repo_url: "https://argoproj.github.io/argo-helm"
+argocd_chart_version: "10.9.2"        # Argo CD v3.5.3
+# Local admin = break-glass account. Log in via authentik SSO once, then set
+# this to false and re-run (production.md SEC-09).
+argocd_admin_enabled: true
+argocd_server_replicas: 2
+argocd_repo_server_replicas: 2
+argocd_appset_replicas: 2
+argocd_kubectl: "{{ cluster_kubectl }} -n {{ argocd_namespace }}"

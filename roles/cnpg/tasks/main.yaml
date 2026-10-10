@@ -1,0 +1,25 @@
+---
+- name: Install / upgrade CloudNativePG operator
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: cnpg
+    release_namespace: "{{ cnpg_namespace }}"
+    create_namespace: true
+    chart_repo_url: "{{ cnpg_chart_repo_url }}"
+    chart_ref: cloudnative-pg
+    chart_version: "{{ cnpg_chart_version }}"
+    release_values:
+      replicaCount: "{{ cnpg_replicas }}"
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          memory: 512Mi
+    wait: true
+    wait_timeout: 5m0s
+
+- name: Wait for CloudNativePG operator rollout
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ cnpg_namespace }} rollout status deployment/cnpg-cloudnative-pg --timeout=180s"
+  changed_when: false
