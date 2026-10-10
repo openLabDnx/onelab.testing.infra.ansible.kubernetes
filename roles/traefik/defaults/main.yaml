@@ -1,0 +1,12 @@
+---
+# Defaults for traefik role
+# Configures RKE2's bundled Traefik (release rke2-traefik in kube-system) through a
+# HelmChartConfig; the Cloudflare tunnel's *.testing route points at its Service.
+traefik_trusted_ips:
+  - "{{ pod_cidr }}"      # cloudflared pods: trust their X-Forwarded-* / client IP
+traefik_resources:
+  requests:
+    cpu: "50m"
+    memory: "128Mi"
+  limits:
+    memory: "512Mi"

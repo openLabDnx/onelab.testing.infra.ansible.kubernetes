@@ -1,0 +1,35 @@
+---
+- name: Apply rke2-traefik HelmChartConfig
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'helmchartconfig.yaml.j2') }}"
+  register: traefik_hcc_apply
+  changed_when: traefik_hcc_apply.stdout is search('(created|configured)')
+
+# RKE2's helm-controller re-runs the chart install; wait until the DaemonSet
+# carries the new spec (no hostPort) and has rolled out on every node.
+- name: Wait for Traefik to drop its hostPorts
+  ansible.builtin.command: >
+    {{ cluster_kubectl }} -n kube-system get ds rke2-traefik
+    -o jsonpath='{.spec.template.spec.containers[0].ports[*].hostPort}'
+  register: traefik_hostports
+  until: traefik_hostports.stdout | trim | length == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Wait for Traefik rollout
+  ansible.builtin.command: "{{ cluster_kubectl }} -n kube-system rollout status ds/rke2-traefik --timeout=300s"
+  changed_when: false
+
+- name: Check the nodes no longer answer on port 80/443
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[item.0]['ansible_host'] }}"
+    port: "{{ item.1 }}"
+    state: stopped
+    timeout: 60
+  loop: "{{ groups['rke2_cluster'] | product([80, 443]) | list }}"
+  loop_control:
+    label: "{{ hostvars[item.0]['ansible_host'] }}:{{ item.1 }}"
+  delegate_to: localhost
+  become: false

@@ -1,7 +1,8 @@
 .PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods \
 	storage vault vault-unseal vault-status vault-ui vault-reset \
 	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
-	apisix apisix-status apisix-admin apisix-reset
+	apisix apisix-status apisix-admin apisix-reset \
+	platform traefik authentik argocd portainer
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -37,6 +38,12 @@ help:
 	@echo "make apisix-status : Gateway/etcd pods, HPA, etcd health, route counts"
 	@echo "make apisix-admin  : SSH tunnel to the Admin API/UI at http://127.0.0.1:9180"
 	@echo "make apisix-reset  : DESTROY APISIX and all routes/consumers"
+	@echo "-----------------------------------------------------------------"
+	@echo "make platform   : Traefik + authentik (SSO) + Argo CD + Portainer, in order"
+	@echo "make traefik    : Traefik settings (no hostPorts) + dashboard behind SSO"
+	@echo "make authentik  : PostgreSQL (CloudNativePG x3) + authentik + SSO blueprint"
+	@echo "make argocd     : Argo CD HA with authentik SSO"
+	@echo "make portainer  : Portainer with authentik SSO"
 	@echo "================================================================="
 
 check:
@@ -107,6 +114,21 @@ apisix-admin:
 
 apisix-reset:
 	ansible-playbook playbooks/apisix-reset.yaml
+
+platform:
+	ansible-playbook playbooks/05-storage.yaml playbooks/09-platform.yaml
+
+traefik:
+	ansible-playbook playbooks/09-platform.yaml --tags traefik
+
+authentik:
+	ansible-playbook playbooks/05-storage.yaml playbooks/09-platform.yaml --tags authentik
+
+argocd:
+	ansible-playbook playbooks/09-platform.yaml --tags argocd
+
+portainer:
+	ansible-playbook playbooks/09-platform.yaml --tags portainer
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

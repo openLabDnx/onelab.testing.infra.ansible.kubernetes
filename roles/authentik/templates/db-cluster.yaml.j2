@@ -1,0 +1,36 @@
+# authentik PostgreSQL (Managed by Ansible)
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ authentik_db_cluster }}
+  namespace: {{ authentik_namespace }}
+spec:
+  instances: {{ authentik_db_instances }}
+  imageName: {{ authentik_db_image }}
+  primaryUpdateStrategy: unsupervised
+  bootstrap:
+    initdb:
+      database: authentik
+      owner: authentik
+      secret:
+        name: authentik-db-app
+  storage:
+    size: {{ authentik_db_size }}
+    storageClass: {{ authentik_db_storage_class }}
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+  affinity:
+    nodeSelector:
+      {{ platform_primary_site_selector | to_nice_yaml | trim | indent(6) }}
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

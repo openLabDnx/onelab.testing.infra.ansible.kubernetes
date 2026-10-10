@@ -1,0 +1,95 @@
+---
+- name: Generate and persist Argo CD admin password
+  ansible.builtin.set_fact:
+    argocd_admin_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/argocd_admin_password chars=ascii_letters,digits length=32') }}"
+  no_log: true
+
+# Hashed once and kept: a new salt or mtime on every run would log every admin
+# out (production.md RUN-04). To rotate, delete both argocd_admin_password* files.
+- name: Bcrypt-hash the admin password once
+  ansible.builtin.copy:
+    dest: "{{ platform_secrets_dir }}/argocd_admin_password.bcrypt"
+    content: "{{ argocd_admin_password | password_hash('bcrypt') }}"
+    force: false
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Read the hash file's date (when the password last changed)
+  ansible.builtin.stat:
+    path: "{{ platform_secrets_dir }}/argocd_admin_password.bcrypt"
+  delegate_to: localhost
+  become: false
+  register: argocd_hash_file
+
+- name: Create Argo CD namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ argocd_namespace }}
+  register: argocd_ns_apply
+  changed_when: argocd_ns_apply.stdout is search('(created|configured)')
+
+# argocd-server adds its own server.secretkey to argocd-secret; apply leaves it alone.
+- name: Create Argo CD Secrets
+  ansible.builtin.command:
+    cmd: "{{ argocd_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: argocd-secret
+        namespace: {{ argocd_namespace }}
+        labels:
+          app.kubernetes.io/name: argocd-secret
+          app.kubernetes.io/part-of: argocd
+      data:
+        admin.password: {{ lookup('ansible.builtin.file', platform_secrets_dir ~ '/argocd_admin_password.bcrypt') | b64encode }}
+        admin.passwordMtime: {{ ('%Y-%m-%dT%H:%M:%SZ' | strftime(argocd_hash_file.stat.mtime | int, utc=true)) | b64encode }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: argocd-oidc-authentik
+        namespace: {{ argocd_namespace }}
+        labels:
+          app.kubernetes.io/part-of: argocd
+      data:
+        clientSecret: {{ argocd_oidc_client_secret | b64encode }}
+  register: argocd_secret_apply
+  changed_when: argocd_secret_apply.stdout is search('(created|configured)')
+  no_log: true
+
+- name: Install / upgrade Argo CD (HA)
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: argocd
+    release_namespace: "{{ argocd_namespace }}"
+    chart_repo_url: "{{ argocd_chart_repo_url }}"
+    chart_ref: argo-cd
+    chart_version: "{{ argocd_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # Return right away and poll the rollouts below: a long-running helm
+    # command re-sent after a dropped SSH session collides with itself.
+    wait: false
+
+- name: Wait for Argo CD rollout
+  ansible.builtin.command: "{{ argocd_kubectl }} rollout status {{ item }} --timeout=300s"
+  loop:
+    - deployment/argocd-server
+    - deployment/argocd-repo-server
+    - deployment/argocd-applicationset-controller
+    - statefulset/argocd-application-controller
+    - statefulset/argocd-redis-ha-server
+    - deployment/argocd-redis-ha-haproxy
+  changed_when: false
+
+- name: Verify Argo CD
+  ansible.builtin.import_tasks: verify.yaml

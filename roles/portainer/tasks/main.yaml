@@ -1,0 +1,205 @@
+---
+- name: Generate and persist Portainer credentials
+  ansible.builtin.set_fact:
+    portainer_admin_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/portainer_admin_password chars=ascii_letters,digits length=32') }}"
+    portainer_db_key: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/portainer_db_key chars=ascii_letters,digits length=48') }}"
+  no_log: true
+
+- name: Create Portainer namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ portainer_namespace }}
+  register: portainer_ns_apply
+  changed_when: portainer_ns_apply.stdout is search('(created|configured)')
+
+# The database key cannot change once Portainer has encrypted its database.
+- name: Create Portainer Secrets
+  ansible.builtin.command:
+    cmd: "{{ portainer_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: portainer-admin-password
+        namespace: {{ portainer_namespace }}
+      data:
+        password: {{ portainer_admin_password | b64encode }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: portainer-db-key
+        namespace: {{ portainer_namespace }}
+      data:
+        secret: {{ portainer_db_key | b64encode }}
+  register: portainer_secret_apply
+  changed_when: portainer_secret_apply.stdout is search('(created|configured)')
+  no_log: true
+
+- name: Install / upgrade Portainer
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: portainer
+    release_namespace: "{{ portainer_namespace }}"
+    chart_repo_url: "{{ portainer_chart_repo_url }}"
+    chart_ref: portainer
+    chart_version: "{{ portainer_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # Return right away and poll the rollouts below: a long-running helm
+    # command re-sent after a dropped SSH session collides with itself.
+    wait: false
+
+- name: Wait for Portainer rollout
+  ansible.builtin.command: "{{ portainer_kubectl }} rollout status deployment/portainer --timeout=300s"
+  changed_when: false
+
+# --- SSO through authentik (OAuth/OIDC), configured over Portainer's API ------
+# The ClusterIP is reachable from the server node through kube-proxy.
+- name: Get Portainer service address
+  ansible.builtin.command: "{{ portainer_kubectl }} get svc portainer -o jsonpath={.spec.clusterIP}"
+  register: portainer_svc_ip
+  changed_when: false
+
+- name: Log in to Portainer as admin
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/auth"
+    method: POST
+    body_format: json
+    body:
+      Username: admin
+      Password: "{{ portainer_admin_password }}"
+  register: portainer_auth
+  until: portainer_auth.status == 200
+  retries: 12
+  delay: 5
+  no_log: true
+
+- name: List Portainer teams
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/teams"
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+  register: portainer_teams
+  no_log: true
+
+- name: Create the SSO users team
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/teams"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+    body_format: json
+    body:
+      Name: "{{ portainer_sso_team }}"
+  register: portainer_team_created
+  changed_when: true
+  when: portainer_sso_team not in (portainer_teams.json | map(attribute='Name') | list)
+  no_log: true
+
+- name: Record the SSO team id
+  ansible.builtin.set_fact:
+    portainer_sso_team_id: >-
+      {{ portainer_team_created.json.Id if portainer_team_created is not skipped
+         else (portainer_teams.json | selectattr('Name', 'equalto', portainer_sso_team) | first).Id }}
+
+- name: Read Portainer settings
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/settings"
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+  register: portainer_settings
+  no_log: true
+
+# Browser-facing URLs are public; token and userinfo calls stay inside the cluster.
+- name: Enable SSO through authentik
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/settings"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+    body_format: json
+    body:
+      AuthenticationMethod: 3
+      OAuthSettings: "{{ portainer_oauth }}"
+  vars:
+    portainer_oauth:
+      ClientID: "{{ portainer_oidc_client_id }}"
+      ClientSecret: "{{ portainer_oidc_client_secret }}"
+      AuthorizationURI: "https://{{ authentik_host }}/application/o/authorize/"
+      AccessTokenURI: "{{ authentik_internal_url }}/application/o/token/"
+      ResourceURI: "{{ authentik_internal_url }}/application/o/userinfo/"
+      RedirectURI: "https://{{ portainer_host }}/"
+      LogoutURI: "https://{{ authentik_host }}/application/o/portainer/end-session/"
+      UserIdentifier: preferred_username
+      Scopes: "openid profile email"
+      OAuthAutoCreateUsers: true
+      DefaultTeamID: "{{ portainer_sso_team_id | int }}"
+      SSO: true
+  register: portainer_oauth_put
+  # the client secret is write-only, so compare the other fields for "changed"
+  changed_when: >-
+    portainer_settings.json.AuthenticationMethod != 3
+    or (portainer_settings.json.OAuthSettings.AuthorizationURI | default('')) != 'https://' ~ authentik_host ~ '/application/o/authorize/'
+    or (portainer_settings.json.OAuthSettings.DefaultTeamID | default(0)) != portainer_sso_team_id | int
+  no_log: true
+
+# Normally created by the "Get started" wizard on first login.
+- name: List Portainer environments
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/endpoints"
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+  register: portainer_endpoints
+  no_log: true
+
+- name: Create the local Kubernetes environment
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/endpoints"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+    body_format: form-urlencoded
+    body:
+      Name: local
+      EndpointCreationType: "5"      # local Kubernetes (this cluster)
+  changed_when: true
+  when: portainer_endpoints.json | length == 0
+  no_log: true
+
+- name: List Portainer users
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/users"
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+  register: portainer_users
+  no_log: true
+
+- name: Make the listed SSO users Portainer administrators
+  ansible.builtin.uri:
+    url: "http://{{ portainer_svc_ip.stdout }}:9000/api/users/{{ item.Id }}"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ portainer_auth.json.jwt }}"
+    body_format: json
+    body:
+      Username: "{{ item.Username }}"
+      Role: 1
+  loop: "{{ portainer_users.json | selectattr('Username', 'in', portainer_admin_users) | rejectattr('Role', 'equalto', 1) | list }}"
+  loop_control:
+    label: "{{ item.Username }}"
+  changed_when: true
+
+- name: Note SSO admins that have not logged in yet
+  ansible.builtin.debug:
+    msg: "Not in Portainer yet (promoted after their first SSO login + re-run): {{ portainer_admin_users | difference(portainer_users.json | map(attribute='Username') | list) }}"
+  when: portainer_admin_users | difference(portainer_users.json | map(attribute='Username') | list) | length > 0
+
+- name: Verify Portainer
+  ansible.builtin.import_tasks: verify.yaml

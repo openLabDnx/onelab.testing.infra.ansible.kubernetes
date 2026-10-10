@@ -1,0 +1,65 @@
+---
+# Platform services: Traefik hardening, CloudNativePG, authentik (SSO),
+# Argo CD and Portainer. Order matters: authentik must exist before the
+# apps that log in through it. Run one part with --tags.
+- name: Label nodes by site
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [always]
+  tasks:
+    - name: Label nodes
+      ansible.builtin.include_role:
+        name: platform_vars
+        tasks_from: label_nodes.yaml
+
+- name: Traefik (RKE2 bundled) production settings
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [traefik]
+  roles:
+    - traefik
+
+- name: CloudNativePG operator
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [cnpg, authentik]
+  roles:
+    - cnpg
+
+- name: authentik (SSO)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [authentik]
+  roles:
+    - authentik
+
+- name: Traefik dashboard behind authentik
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [traefik, authentik]
+  tasks:
+    - name: Publish Traefik dashboard
+      ansible.builtin.include_role:
+        name: traefik
+        tasks_from: dashboard.yaml
+
+- name: Argo CD (GitOps)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [argocd]
+  roles:
+    - argocd
+
+- name: Portainer
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [portainer]
+  roles:
+    - portainer

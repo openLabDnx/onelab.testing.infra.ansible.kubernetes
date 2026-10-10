@@ -1,0 +1,4 @@
+---
+dependencies:
+  - role: platform_vars
+  - role: helm

@@ -1,0 +1,44 @@
+---
+# Shared settings for the platform roles (traefik, authentik, argocd, portainer).
+# Every public host sits under *.testing.autofik.com, which the Cloudflare tunnel
+# already sends to Traefik, so adding a host needs no Cloudflare change.
+platform_domain: "testing.autofik.com"
+authentik_host: "auth.{{ platform_domain }}"
+argocd_host: "argocd.{{ platform_domain }}"
+portainer_host: "portainer.{{ platform_domain }}"
+traefik_dashboard_host: "traefik.{{ platform_domain }}"
+
+authentik_namespace: "authentik"
+argocd_namespace: "argocd"
+portainer_namespace: "portainer"
+
+# authentik group whose members administer Argo CD, Portainer and the Traefik dashboard
+platform_admin_group: "platform-admins"
+
+# Generated credentials live here on the controller (git-ignored)
+platform_secrets_dir: "{{ inventory_dir }}/../secrets/platform"
+
+# OIDC clients registered in authentik (secrets generated once, shared with the apps)
+argocd_oidc_client_id: "argocd"
+portainer_oidc_client_id: "portainer"
+argocd_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/argocd_oidc_client_secret chars=ascii_letters,digits length=48') }}"
+portainer_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/portainer_oidc_client_secret chars=ascii_letters,digits length=48') }}"
+
+# Node sites. master and worker2 share a data centre (~1 ms); worker1 is ~160 ms
+# away. Database-backed apps (authentik + PostgreSQL, Argo CD, Portainer) run
+# on the primary site only, so no request pays the round trip on every query.
+platform_node_site_label: "autofik.com/site"
+platform_node_sites:
+  autofik-master-svr-ram-12gb: eu
+  autofik-worker2-24gb: eu
+  autofik-worker1: ap
+platform_primary_site: eu
+platform_primary_site_selector:
+  autofik.com/site: "{{ platform_primary_site }}"
+
+# In-cluster addresses
+authentik_internal_url: "http://authentik-server.{{ authentik_namespace }}.svc.cluster.local"
+pod_cidr: "10.42.0.0/16"
+
+rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"

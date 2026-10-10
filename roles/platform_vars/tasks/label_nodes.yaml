@@ -1,0 +1,10 @@
+---
+- name: Label nodes with their site
+  ansible.builtin.command: >
+    {{ cluster_kubectl }} label node {{ item.key }}
+    {{ platform_node_site_label }}={{ item.value }} --overwrite
+  loop: "{{ platform_node_sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  register: platform_label
+  changed_when: platform_label.stdout is search(' labeled') and platform_label.stdout is not search('not labeled')

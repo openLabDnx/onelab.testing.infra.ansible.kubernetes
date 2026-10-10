@@ -1,0 +1,150 @@
+---
+# --- credentials (generated once on the controller, git-ignored) ------------
+- name: Generate and persist authentik credentials
+  ansible.builtin.set_fact:
+    authentik_secret_key: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/authentik_secret_key chars=ascii_letters,digits length=60') }}"
+    authentik_db_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/authentik_db_password chars=ascii_letters,digits length=40') }}"
+    authentik_bootstrap_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/authentik_akadmin_password chars=ascii_letters,digits length=32') }}"
+  no_log: true
+
+- name: Restrict local credential files
+  ansible.builtin.file:
+    path: "{{ platform_secrets_dir }}"
+    state: directory
+    mode: "0700"
+    recurse: true
+  delegate_to: localhost
+  become: false
+
+- name: Create authentik namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ authentik_namespace }}
+  register: authentik_ns_apply
+  changed_when: authentik_ns_apply.stdout is search('(created|configured)')
+
+# Credentials only in Secrets (SEC-07): the database owner for CloudNativePG,
+# and every authentik setting, read by server and worker through envFrom.
+# No AUTHENTIK_BOOTSTRAP_TOKEN: nothing here needs a superuser API token.
+- name: Create authentik Secrets
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: kubernetes.io/basic-auth
+      metadata:
+        name: authentik-db-app
+        namespace: {{ authentik_namespace }}
+      data:
+        username: {{ 'authentik' | b64encode }}
+        password: {{ authentik_db_password | b64encode }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: authentik-config
+        namespace: {{ authentik_namespace }}
+      data:
+        AUTHENTIK_SECRET_KEY: {{ authentik_secret_key | b64encode }}
+        AUTHENTIK_POSTGRESQL__HOST: {{ (authentik_db_cluster ~ '-rw') | b64encode }}
+        AUTHENTIK_POSTGRESQL__NAME: {{ 'authentik' | b64encode }}
+        AUTHENTIK_POSTGRESQL__USER: {{ 'authentik' | b64encode }}
+        AUTHENTIK_POSTGRESQL__PASSWORD: {{ authentik_db_password | b64encode }}
+        AUTHENTIK_ERROR_REPORTING__ENABLED: {{ 'false' | b64encode }}
+        AUTHENTIK_LOG_LEVEL: {{ 'info' | b64encode }}
+        AUTHENTIK_BOOTSTRAP_EMAIL: {{ authentik_bootstrap_email | b64encode }}
+        AUTHENTIK_BOOTSTRAP_PASSWORD: {{ authentik_bootstrap_password | b64encode }}
+        ARGOCD_OIDC_CLIENT_SECRET: {{ argocd_oidc_client_secret | b64encode }}
+        PORTAINER_OIDC_CLIENT_SECRET: {{ portainer_oidc_client_secret | b64encode }}
+  register: authentik_secret_apply
+  changed_when: authentik_secret_apply.stdout is search('(created|configured)')
+  no_log: true
+
+# --- database ----------------------------------------------------------------
+- name: Create authentik PostgreSQL cluster
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'db-cluster.yaml.j2') }}"
+  register: authentik_db_apply
+  changed_when: authentik_db_apply.stdout is search('(created|configured)')
+
+- name: Wait for the PostgreSQL cluster to be ready
+  ansible.builtin.command: "{{ authentik_kubectl }} wait cluster/{{ authentik_db_cluster }} --for=condition=Ready --timeout=900s"
+  changed_when: false
+
+# --- authentik ---------------------------------------------------------------
+- name: Publish the platform blueprint
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: authentik-blueprints
+        namespace: {{ authentik_namespace }}
+      data:
+        platform.yaml: |
+          {{ lookup('ansible.builtin.template', 'platform-blueprint.yaml.j2') | indent(4) }}
+  register: authentik_blueprint_apply
+  changed_when: authentik_blueprint_apply.stdout is search('(created|configured)')
+
+- name: Install / upgrade authentik
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: authentik
+    release_namespace: "{{ authentik_namespace }}"
+    chart_repo_url: "{{ authentik_chart_repo_url }}"
+    chart_ref: authentik
+    chart_version: "{{ authentik_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # Return right away and poll the rollouts below: a long-running helm
+    # command re-sent after a dropped SSH session collides with itself.
+    wait: false
+
+# envFrom is read at container start only.
+- name: Restart authentik after a configuration change
+  ansible.builtin.command: "{{ authentik_kubectl }} rollout restart deployment/authentik-server deployment/authentik-worker"
+  when: authentik_secret_apply.stdout is search('configured')
+
+- name: Wait for authentik rollout
+  ansible.builtin.command: "{{ authentik_kubectl }} rollout status deployment/{{ item }} --timeout=900s"
+  loop: [authentik-server, authentik-worker]
+  changed_when: false
+
+# On a fresh database the worker creates akadmin, the default flows and the
+# self-signed certificate in the background; until then the blueprint's !Find
+# lookups fail, so retry. Applying here (rather than waiting for the worker's
+# own discovery) surfaces blueprint errors in this run.
+- name: Apply the platform blueprint
+  ansible.builtin.command: >
+    {{ authentik_kubectl }} exec deploy/authentik-worker -c worker --
+    ak apply_blueprint /blueprints/mounted/cm-authentik-blueprints/platform.yaml
+  register: authentik_blueprint_run
+  until: authentik_blueprint_run.rc == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Create Traefik forward-auth middleware
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'middleware.yaml.j2') }}"
+  register: authentik_mw_apply
+  changed_when: authentik_mw_apply.stdout is search('(created|configured)')
+
+- name: Create database backup CronJob
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'backup.yaml.j2') }}"
+  register: authentik_backup_apply
+  changed_when: authentik_backup_apply.stdout is search('(created|configured)')
+
+- name: Verify authentik
+  ansible.builtin.import_tasks: verify.yaml

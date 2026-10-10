@@ -1,0 +1,61 @@
+# authentik Helm values (Managed by Ansible)
+authentik:
+  # all settings and credentials come from the authentik-config Secret
+  existingSecret:
+    secretName: authentik-config
+
+postgresql:
+  enabled: false        # CloudNativePG cluster {{ authentik_db_cluster }} instead
+
+blueprints:
+  configMaps:
+    - authentik-blueprints
+
+server:
+  replicas: {{ authentik_server_replicas }}
+  nodeSelector:
+    {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
+  pdb:
+    enabled: true
+    minAvailable: 1
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: authentik
+          app.kubernetes.io/component: server
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - {{ authentik_host }}
+
+worker:
+  replicas: {{ authentik_worker_replicas }}
+  nodeSelector:
+    {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
+  pdb:
+    enabled: true
+    minAvailable: 1
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: authentik
+          app.kubernetes.io/component: worker
+  resources:
+    requests:
+      cpu: 50m
+      memory: 384Mi
+    limits:
+      memory: 1Gi

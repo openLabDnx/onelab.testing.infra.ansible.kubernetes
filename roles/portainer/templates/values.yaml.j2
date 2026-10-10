@@ -1,0 +1,42 @@
+# Portainer CE Helm values (Managed by Ansible)
+image:
+  repository: portainer/portainer-ce
+  tag: "{{ portainer_image_tag }}"
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  {{ platform_primary_site_selector | to_nice_yaml | trim | indent(2) }}
+
+service:
+  type: ClusterIP
+
+# required behind a reverse proxy on another host name (CSRF origin check)
+trusted_origins:
+  enabled: true
+  domains: "https://{{ portainer_host }}"   # scheme required (Portainer 2.45)
+
+# admin created from this Secret at first start; database encrypted at rest
+adminPassword:
+  existingSecret: portainer-admin-password
+dbEncryption:
+  existingSecret: portainer-db-key
+
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  hosts:
+    - host: {{ portainer_host }}
+      paths:
+        - path: /
+
+persistence:
+  enabled: true
+  size: "{{ portainer_storage_size }}"
+  storageClass: "{{ portainer_storage_class }}"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
