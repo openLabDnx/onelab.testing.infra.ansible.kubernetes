@@ -1,6 +1,7 @@
 .PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods \
 	storage vault vault-unseal vault-status vault-ui vault-reset \
-	cloudflare cloudflare-connector cloudflare-status cloudflare-reset
+	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
+	apisix apisix-status apisix-admin apisix-reset
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -31,6 +32,11 @@ help:
 	@echo "make cloudflare-connector : Only (re)deploy cloudflared (no API calls)"
 	@echo "make cloudflare-status : Tunnel health, edge certs, live probes"
 	@echo "make cloudflare-reset  : Delete tunnel, DNS records, Access app"
+	@echo "-----------------------------------------------------------------"
+	@echo "make apisix        : Deploy APISIX gateway HA (etcd x3, Admin UI, smoke test)"
+	@echo "make apisix-status : Gateway/etcd pods, HPA, etcd health, route counts"
+	@echo "make apisix-admin  : SSH tunnel to the Admin API/UI at http://127.0.0.1:9180"
+	@echo "make apisix-reset  : DESTROY APISIX and all routes/consumers"
 	@echo "================================================================="
 
 check:
@@ -89,6 +95,18 @@ cloudflare-status:
 
 cloudflare-reset:
 	ansible-playbook playbooks/cloudflare-reset.yaml
+
+apisix:
+	ansible-playbook playbooks/05-storage.yaml playbooks/08-apisix.yaml
+
+apisix-status:
+	ansible-playbook playbooks/apisix-status.yaml
+
+apisix-admin:
+	@./scripts/apisix_admin_tunnel.sh
+
+apisix-reset:
+	ansible-playbook playbooks/apisix-reset.yaml
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

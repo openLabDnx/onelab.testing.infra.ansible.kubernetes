@@ -1,0 +1,35 @@
+{% include 'admin-prelude.sh.j2' %}
+
+# Creates a throwaway route, checks every gateway pod serves it (config synced
+# through etcd) and that the client IP comes from CF-Connecting-IP, then deletes it.
+FAILED=0
+check() { if [ "$2" = "$3" ]; then echo "OK    $1: $2"; else echo "FAIL  $1: got '$2', want '$3'"; FAILED=1; fi; }
+ROUTE="$ADMIN/routes/ansible-smoke-test"
+
+check "Admin API with generated key" "$(admin -o /dev/null -w '%{http_code}' "$ADMIN/routes")" 200
+check "Admin API with chart default key" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' "$ADMIN/routes")" 401
+check "Admin UI" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19180/ui/)" 200
+
+# plugin-only route: echoes the client address APISIX resolved
+ROUTE_JSON='{"uri": "/__ansible_smoke_test", "plugins": {"serverless-pre-function": {"phase": "access",
+  "functions": ["return function(conf, ctx) require(\"apisix.core\").response.exit(200, ngx.var.remote_addr) end"]}}}'
+code="$(admin -X PUT "$ROUTE" -o /dev/null -w '%{http_code}' -d "$ROUTE_JSON")"
+case "$code" in 200|201) code=created ;; esac
+check "create test route" "$code" created
+sleep 3   # gateways pick the route up through their etcd watch
+
+for ip in $($K get pods -l {{ apisix_gateway_selector }} --field-selector=status.phase=Running -o jsonpath='{.items[*].status.podIP}'); do
+  code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$ip:9080/__ansible_smoke_test")"
+  check "gateway pod $ip serves the route" "$code" 200
+done
+
+SVC="$($K get svc {{ apisix_release_name }}-gateway -o jsonpath='{.spec.clusterIP}')"
+check "client IP taken from {{ apisix_real_ip_header }}" \
+  "$(curl -s -m 5 -H '{{ apisix_real_ip_header }}: 203.0.113.7' "http://$SVC/__ansible_smoke_test")" 203.0.113.7
+check "unknown path" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$SVC/__no_such_route")" 404
+check "Server header hides version" \
+  "$(curl -sI -m 5 "http://$SVC/__no_such_route" | tr -d '\r' | awk -F': ' 'tolower($1)=="server"{print $2}')" APISIX
+
+check "delete test route" "$(admin -X DELETE "$ROUTE" -o /dev/null -w '%{http_code}')" 200
+exit $FAILED

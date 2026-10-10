@@ -1,0 +1,14 @@
+---
+- name: Read APISIX status
+  ansible.builtin.command:
+    cmd: bash -s
+    stdin: "{{ lookup('ansible.builtin.template', 'status.sh.j2') }}"
+  environment:
+    ADMIN_ROLE: viewer
+  register: apisix_status
+  changed_when: false
+  failed_when: false
+
+- name: Display APISIX status
+  ansible.builtin.debug:
+    msg: "{{ apisix_status.stdout_lines + apisix_status.stderr_lines }}"

@@ -21,9 +21,9 @@
   ansible.builtin.import_tasks: certificate.yaml
   tags: [cloudflare_api]
 
-- name: Ensure Cloudflare Access for Vault
+- name: Ensure Cloudflare Access for the admin UIs
   ansible.builtin.import_tasks: access.yaml
-  when: cloudflare_vault_enabled
+  when: cloudflare_access_protected | length > 0
   tags: [cloudflare_api]
 
 - name: Run cloudflared in the cluster

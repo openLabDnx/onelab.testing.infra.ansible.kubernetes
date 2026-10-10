@@ -1,0 +1,38 @@
+---
+- name: "{{ access_target.hostname }} | look up Access application"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps?domain={{ access_target.hostname }}&exact=true"
+
+- name: "{{ access_target.hostname }} | find Access application"
+  ansible.builtin.set_fact:
+    access_app: "{{ cf_response.result | selectattr('domain', 'equalto', access_target.hostname) | first | default({}) }}"
+    access_app_body:
+      name: "{{ access_target.name }}"
+      domain: "{{ access_target.hostname }}"
+      type: self_hosted
+      session_duration: "{{ cloudflare_access_session_duration }}"
+      app_launcher_visible: true
+      policies:
+        - id: "{{ access_policy_id }}"
+          precedence: 1
+
+- name: "{{ access_target.hostname }} | create Access application"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: POST
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps"
+    cf_body: "{{ access_app_body }}"
+  when: access_app | length == 0
+
+- name: "{{ access_target.hostname }} | update Access application when it drifted"
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_method: PUT
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps/{{ access_app.id }}"
+    cf_body: "{{ access_app_body }}"
+  when:
+    - access_app | length > 0
+    - access_app.name != access_target.name
+      or access_app.session_duration | default('') != cloudflare_access_session_duration
+      or (access_app.policies | default([]) | map(attribute='id') | list) != [access_policy_id]

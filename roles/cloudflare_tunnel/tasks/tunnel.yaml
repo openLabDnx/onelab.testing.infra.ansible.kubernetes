@@ -30,7 +30,7 @@
         cloudflare_tunnel_target: "{{ cloudflare_tunnel_id }}.cfargotunnel.com"
       no_log: true
 
-# Rules are evaluated top-down: Vault, extra routes, wildcard -> Traefik, then 404.
+# Rules are evaluated top-down: Vault, APISIX admin, extra routes, wildcard -> Traefik, then 404.
 - name: Build tunnel ingress rules
   ansible.builtin.set_fact:
     cloudflare_ingress_rules: >-
@@ -38,6 +38,8 @@
             'service': cloudflare_vault_origin,
             'originRequest': {'caPool': cloudflared_vault_ca_mount ~ '/ca.crt'}}]
           if cloudflare_vault_enabled else [])
+         + ([{'hostname': cloudflare_apisix_admin_hostname, 'service': cloudflare_apisix_admin_origin}]
+            if cloudflare_apisix_admin_enabled else [])
          + cloudflare_extra_routes
          + ([{'hostname': '*.' ~ cloudflare_base_domain, 'service': cloudflare_traefik_origin}]
             if cloudflare_wildcard_to_traefik else [])

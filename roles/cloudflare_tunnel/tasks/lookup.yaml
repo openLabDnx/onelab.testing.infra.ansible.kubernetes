@@ -71,5 +71,33 @@
   ansible.builtin.set_fact:
     cloudflare_public_hostnames: >-
       {{ ([cloudflare_vault_hostname] if cloudflare_vault_enabled else [])
+         + ([cloudflare_apisix_admin_hostname] if cloudflare_apisix_admin_enabled else [])
          + (cloudflare_extra_routes | map(attribute='hostname') | list)
          + (['*.' ~ cloudflare_base_domain] if cloudflare_wildcard_to_traefik else []) }}
+
+- name: Build Access-protected application list
+  ansible.builtin.set_fact:
+    cloudflare_access_protected: >-
+      {{ ([{'name': cloudflare_access_app_name, 'hostname': cloudflare_vault_hostname}] if cloudflare_vault_enabled else [])
+         + ([{'name': cloudflare_apisix_admin_app_name, 'hostname': cloudflare_apisix_admin_hostname}] if cloudflare_apisix_admin_enabled else []) }}
+
+# Admin UIs must never go live without their Access app: check Access works
+# before anything is written (routes and DNS are applied before access.yaml).
+- name: Check Cloudflare Access is usable before publishing admin UIs
+  ansible.builtin.include_tasks: api.yaml
+  vars:
+    cf_path: "/accounts/{{ cloudflare_account_id }}/access/apps?domain={{ cloudflare_access_protected[0].hostname }}"
+    cf_allow_fail: true
+  when: cloudflare_access_protected | length > 0
+
+- name: Refuse to publish admin UIs without Cloudflare Access
+  ansible.builtin.fail:
+    msg: >-
+      Cloudflare Access is not usable ({{ cf_response.errors | default([]) | map(attribute='message') | join('; ') }}).
+      Nothing was changed: {{ cloudflare_access_protected | map(attribute='hostname') | join(', ') }} must sit behind Access.
+      Enable Access (Zero Trust dashboard > Access, add the One-time PIN login method) and give the token
+      Account > Access: Apps and Policies: Edit, or publish only the rest:
+      ansible-playbook playbooks/07-cloudflare.yaml -e '{"cloudflare_vault_enabled": false, "cloudflare_apisix_admin_enabled": false}'
+  when:
+    - cloudflare_access_protected | length > 0
+    - not (cf_response.success | default(false))

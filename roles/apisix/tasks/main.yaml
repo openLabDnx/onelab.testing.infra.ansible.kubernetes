@@ -1,0 +1,142 @@
+---
+# --- secrets (generated once on the controller, git-ignored) ----------------
+- name: Prepare local APISIX secrets
+  delegate_to: localhost
+  become: false
+  run_once: true
+  block:
+    - name: Ensure local APISIX secrets directory exists
+      ansible.builtin.file:
+        path: "{{ apisix_local_secrets_dir }}"
+        state: directory
+        mode: "0700"
+
+    # Signing key for etcd auth tokens. Left to the chart it is regenerated
+    # through a Helm lookup, and a changed key restarts every etcd member.
+    - name: Generate etcd JWT signing key
+      ansible.builtin.command:
+        argv: [openssl, genpkey, -algorithm, RSA, -pkeyopt, "rsa_keygen_bits:2048",
+               -out, "{{ apisix_local_secrets_dir }}/etcd_jwt_key.pem"]
+        creates: "{{ apisix_local_secrets_dir }}/etcd_jwt_key.pem"
+
+- name: Generate and persist Admin API keys
+  ansible.builtin.set_fact:
+    apisix_admin_key: "{{ lookup('ansible.builtin.password', apisix_local_secrets_dir ~ '/admin_key chars=digits,abcdef length=32') | lower }}"
+    apisix_viewer_key: "{{ lookup('ansible.builtin.password', apisix_local_secrets_dir ~ '/viewer_key chars=digits,abcdef length=32') | lower }}"
+  no_log: true
+
+# Store exactly the value the gateway uses, so `cat admin_key` works as X-API-KEY.
+- name: Write Admin API keys back as deployed (0600)
+  ansible.builtin.copy:
+    content: "{{ item.value }}"
+    dest: "{{ apisix_local_secrets_dir }}/{{ item.key }}"
+    mode: "0600"
+  loop:
+    - { key: admin_key, value: "{{ apisix_admin_key }}" }
+    - { key: viewer_key, value: "{{ apisix_viewer_key }}" }
+  loop_control:
+    label: "{{ item.key }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Restrict etcd JWT signing key file
+  ansible.builtin.file:
+    path: "{{ apisix_local_secrets_dir }}/etcd_jwt_key.pem"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+# --- cluster objects -----------------------------------------------------------
+- name: Create APISIX namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ apisix_namespace }}
+  register: apisix_ns_apply
+  changed_when: apisix_ns_apply.stdout is search('(created|configured)')
+
+# Pods read the keys at start only: after rotating, `kubectl -n apisix rollout restart deploy/apisix`.
+- name: Create Admin API keys Secret
+  ansible.builtin.command:
+    cmd: "{{ apisix_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: apisix-admin-credentials
+        namespace: {{ apisix_namespace }}
+      data:
+        admin: {{ apisix_admin_key | b64encode }}
+        viewer: {{ apisix_viewer_key | b64encode }}
+  register: apisix_admin_secret_apply
+  changed_when: apisix_admin_secret_apply.stdout is search('(created|configured)')
+  no_log: true
+
+- name: Create etcd JWT signing key Secret
+  ansible.builtin.command:
+    cmd: "{{ apisix_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: apisix-etcd-jwt
+        namespace: {{ apisix_namespace }}
+      data:
+        jwt-token.pem: {{ lookup('ansible.builtin.file', apisix_local_secrets_dir ~ '/etcd_jwt_key.pem') | b64encode }}
+  register: apisix_etcd_secret_apply
+  changed_when: apisix_etcd_secret_apply.stdout is search('(created|configured)')
+  no_log: true
+
+- name: Install / upgrade APISIX gateway and its etcd
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: "{{ apisix_release_name }}"
+    release_namespace: "{{ apisix_namespace }}"
+    chart_repo_url: "{{ apisix_chart_repo_url }}"
+    chart_ref: apisix
+    chart_version: "{{ apisix_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    wait: true
+    wait_timeout: 10m0s
+
+# Server-side diff/apply: client-side apply reports a PDB as "configured" on
+# every run (its selector is a replace-strategy field), hiding real changes.
+# --force-conflicts: Ansible is the only owner of these objects.
+- name: Check gateway PDB, HPA and NetworkPolicy for drift
+  ansible.builtin.command:
+    cmd: "{{ apisix_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'k8s-extras.yaml.j2') }}"
+  register: apisix_extras_diff
+  changed_when: false
+  failed_when: apisix_extras_diff.rc > 1
+
+- name: Apply gateway PDB, HPA and NetworkPolicy
+  ansible.builtin.command:
+    cmd: "{{ apisix_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'k8s-extras.yaml.j2') }}"
+  when: apisix_extras_diff.rc == 1
+
+# Keys are only read at container start.
+- name: Restart gateway after an Admin API key change
+  ansible.builtin.command: "{{ apisix_kubectl }} rollout restart deployment/{{ apisix_release_name }}"
+  when: apisix_admin_secret_apply.stdout is search('configured')
+
+- name: Wait for APISIX gateway rollout
+  ansible.builtin.command: "{{ apisix_kubectl }} rollout status deployment/{{ apisix_release_name }} --timeout=300s"
+  changed_when: false
+
+- name: Check that every etcd member joined
+  ansible.builtin.command: "{{ apisix_kubectl }} exec {{ apisix_release_name }}-etcd-0 -c etcd -- etcdctl member list"
+  register: apisix_etcd_members
+  changed_when: false
+  failed_when: apisix_etcd_members.stdout_lines | select('search', ', started, ') | list | length != apisix_etcd_replicas | int
+
+- name: Verify APISIX end to end
+  ansible.builtin.import_tasks: verify.yaml

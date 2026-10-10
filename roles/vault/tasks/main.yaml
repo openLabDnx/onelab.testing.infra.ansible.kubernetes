@@ -1,7 +1,4 @@
 ---
-- name: Install Helm on the primary server
-  ansible.builtin.import_tasks: helm.yaml
-
 - name: Generate TLS material and Kubernetes secret
   ansible.builtin.import_tasks: tls.yaml
 

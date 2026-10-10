@@ -11,6 +11,11 @@
     helm_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
     helm_archive_url: "https://get.helm.sh/helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz"
   block:
+    - name: Gather CPU architecture
+      ansible.builtin.setup:
+        gather_subset: [min]
+      when: ansible_architecture is not defined
+
     - name: Download Helm archive
       ansible.builtin.get_url:
         url: "{{ helm_archive_url }}"
