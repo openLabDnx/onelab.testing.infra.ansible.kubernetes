@@ -1,0 +1,2 @@
+# Vault unseal keys, root token and TLS private keys - never commit
+secrets/

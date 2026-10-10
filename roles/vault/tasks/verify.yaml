@@ -1,0 +1,20 @@
+---
+- name: Wait for all Vault server pods to become Ready
+  ansible.builtin.command: >
+    {{ vault_kubectl }} wait --for=condition=Ready pod
+    -l {{ vault_server_selector }} --timeout=300s
+  changed_when: false
+
+- name: Show Vault cluster status
+  ansible.builtin.import_tasks: status.yaml
+  vars:
+    vault_wait_for_voters: true
+
+- name: Display access instructions
+  ansible.builtin.debug:
+    msg:
+      - "Vault HA is up: {{ vault_replicas }} raft voters, TLS CA at {{ vault_local_tls_dir }}/ca.crt"
+      - "In-cluster address: https://{{ vault_release_name }}.{{ vault_namespace }}.svc:8200"
+      - "{{ ('UI: https://<node-ip>:' ~ vault_ui_node_port) if vault_ui_service_type == 'NodePort' else 'UI: run `make vault-ui`, then open https://127.0.0.1:8200' }}"
+      - "Unseal keys / root token: {{ vault_init_file }} (move them somewhere safe)"
+      - "After any Vault pod restart, run `make vault-unseal`."

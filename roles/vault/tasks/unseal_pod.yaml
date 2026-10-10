@@ -1,0 +1,39 @@
+---
+# A freshly started follower reports initialized=true once its raft retry_join has
+# fetched the bootstrap challenge from the leader; only then can it be unsealed.
+- name: "{{ vault_pod }} | wait until initialized"
+  ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_pod }} -c vault -- vault status -format=json"
+  register: vault_pod_status
+  until: vault_pod_status.rc in [0, 2] and (vault_pod_status.stdout | from_json).initialized
+  retries: 36
+  delay: 5
+  changed_when: false
+  failed_when: vault_pod_status.rc not in [0, 2]
+
+# Keys go through stdin so they never appear in process lists or API server exec URLs.
+- name: "{{ vault_pod }} | submit unseal key shares"
+  ansible.builtin.command:
+    cmd: "{{ vault_kubectl }} exec -i {{ vault_pod }} -c vault -- vault write -format=json sys/unseal key=-"
+    stdin: "{{ item }}"
+    stdin_add_newline: false
+  loop: "{{ vault_init_data.unseal_keys_b64[:vault_init_data.unseal_threshold] }}"
+  when: (vault_pod_status.stdout | from_json).sealed
+  register: vault_unseal_submit
+  failed_when: false
+  no_log: true
+
+- name: "{{ vault_pod }} | report unseal errors"
+  ansible.builtin.fail:
+    msg: "{{ vault_unseal_errors }}"
+  vars:
+    vault_unseal_errors: "{{ vault_unseal_submit.results | default([]) | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | map(attribute='stderr') | unique | list }}"
+  when: vault_unseal_errors | length > 0
+
+- name: "{{ vault_pod }} | confirm unsealed"
+  ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_pod }} -c vault -- vault status -format=json"
+  register: vault_pod_final
+  until: vault_pod_final.rc == 0
+  retries: 6
+  delay: 5
+  changed_when: (vault_pod_status.stdout | from_json).sealed
+  failed_when: vault_pod_final.rc != 0

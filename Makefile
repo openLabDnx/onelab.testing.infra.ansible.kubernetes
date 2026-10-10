@@ -1,4 +1,5 @@
-.PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods
+.PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods \
+	storage vault vault-unseal vault-status vault-ui vault-reset
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -17,6 +18,13 @@ help:
 	@echo "make nodes       : Run kubectl get nodes (using local kubeconfig)"
 	@echo "make pods        : Run kubectl get pods -A (using local kubeconfig)"
 	@echo "make reset       : Cleanly uninstall RKE2 from all nodes"
+	@echo "-----------------------------------------------------------------"
+	@echo "make storage     : Install local-path-provisioner StorageClasses"
+	@echo "make vault       : Deploy Vault HA (storage -> helm -> init -> unseal)"
+	@echo "make vault-unseal: Unseal Vault pods after a restart"
+	@echo "make vault-status: Show Vault pods, seal state and raft peers"
+	@echo "make vault-ui    : SSH tunnel to the Vault UI at https://127.0.0.1:8200"
+	@echo "make vault-reset : DESTROY Vault and all of its data"
 	@echo "================================================================="
 
 check:
@@ -45,6 +53,24 @@ verify:
 
 reset:
 	ansible-playbook playbooks/reset.yaml
+
+storage:
+	ansible-playbook playbooks/05-storage.yaml
+
+vault:
+	ansible-playbook playbooks/05-storage.yaml playbooks/06-vault.yaml
+
+vault-unseal:
+	ansible-playbook playbooks/vault-unseal.yaml
+
+vault-status:
+	ansible-playbook playbooks/vault-status.yaml
+
+vault-ui:
+	@./scripts/vault_ui_tunnel.sh
+
+vault-reset:
+	ansible-playbook playbooks/vault-reset.yaml
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

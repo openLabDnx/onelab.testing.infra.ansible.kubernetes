@@ -1,0 +1,23 @@
+---
+- name: Install / upgrade Vault Helm release
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: "{{ vault_release_name }}"
+    release_namespace: "{{ vault_namespace }}"
+    chart_repo_url: "{{ vault_chart_repo_url }}"
+    chart_ref: vault
+    chart_version: "{{ vault_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # Pods only become Ready once unsealed, so never let Helm wait on them.
+    wait: false
+
+- name: Wait for all Vault server pods to be Running
+  ansible.builtin.command: >
+    {{ vault_kubectl }} get pods -l {{ vault_server_selector }}
+    -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}'
+  register: vault_pod_phases
+  until: vault_pod_phases.stdout_lines | select('equalto', 'Running') | list | length == vault_replicas
+  retries: 60
+  delay: 10
+  changed_when: false

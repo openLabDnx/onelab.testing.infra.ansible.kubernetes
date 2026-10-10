@@ -1,0 +1,73 @@
+---
+- name: Read initialization status of every Vault pod
+  ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_release_name }}-{{ item }} -c vault -- vault status -format=json"
+  loop: "{{ range(vault_replicas) | list }}"
+  loop_control:
+    label: "{{ vault_release_name }}-{{ item }}"
+  register: vault_init_check
+  # vault status exits 0 when unsealed, 2 when sealed, 1 on error (listener not up yet)
+  until: vault_init_check.rc in [0, 2]
+  retries: 24
+  delay: 5
+  changed_when: false
+  failed_when: vault_init_check.rc not in [0, 2]
+
+# Never initialize if any pod already holds cluster data, otherwise vault-0 would
+# bootstrap a second, separate cluster.
+- name: Determine whether the Vault cluster is already initialized
+  ansible.builtin.set_fact:
+    vault_cluster_initialized: "{{ vault_init_check.results | map(attribute='stdout') | map('from_json') | selectattr('initialized') | list | length > 0 }}"
+
+- name: Initialize Vault on {{ vault_release_name }}-0
+  when: not vault_cluster_initialized
+  block:
+    - name: Run vault operator init
+      ansible.builtin.command: >
+        {{ vault_kubectl }} exec {{ vault_release_name }}-0 -c vault --
+        vault operator init
+        -key-shares={{ vault_key_shares }}
+        -key-threshold={{ vault_key_threshold }}
+        -format=json
+      register: vault_init_result
+      no_log: true
+
+    - name: Save unseal keys and root token to the controller
+      ansible.builtin.copy:
+        content: "{{ vault_init_result.stdout | from_json | to_nice_json }}\n"
+        dest: "{{ vault_init_file }}"
+        mode: "0600"
+        backup: yes
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Remind operator to secure the unseal keys
+      ansible.builtin.debug:
+        msg:
+          - "Vault initialized. Unseal keys + root token saved to: {{ vault_init_file }}"
+          - "Copy this file to a password manager / split the keys between people, then remove it from this machine."
+          - "Without {{ vault_key_threshold }} of the {{ vault_key_shares }} keys the data in Vault is unrecoverable."
+
+  rescue:
+    # The keys exist only in memory at this point; never drop them silently.
+    - name: Store init output on the server as a last resort
+      ansible.builtin.copy:
+        content: "{{ vault_init_result.stdout }}\n"
+        dest: "/root/vault-init.rescue.json"
+        mode: "0600"
+      when: vault_init_result.stdout is defined and vault_init_result.stdout | length > 0
+      no_log: true
+
+    - name: Abort after failed initialization
+      ansible.builtin.fail:
+        msg: >-
+          Vault initialization failed.
+          {% if vault_init_result.stdout is defined and vault_init_result.stdout | length > 0 %}
+          Vault WAS initialized but the keys could not be saved locally; they were written to
+          /root/vault-init.rescue.json on {{ inventory_hostname }}. Move that file to {{ vault_init_file }}.
+          {% else %}
+          {{ vault_init_result.stderr | default('see the error above') }}
+          {% endif %}
+
+- name: Load unseal keys
+  ansible.builtin.import_tasks: load_keys.yaml

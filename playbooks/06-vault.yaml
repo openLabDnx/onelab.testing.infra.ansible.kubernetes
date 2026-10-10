@@ -1,0 +1,7 @@
+---
+- name: Deploy HashiCorp Vault HA cluster (Raft integrated storage, TLS)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: yes
+  roles:
+    - vault

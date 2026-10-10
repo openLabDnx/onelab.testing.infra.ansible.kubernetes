@@ -1,0 +1,65 @@
+---
+- name: List Vault server pods with seal / leader labels
+  ansible.builtin.command: >
+    {{ vault_kubectl }} get pods -l {{ vault_server_selector }} -o wide
+    -L vault-active,vault-sealed,vault-version
+  register: vault_pods_table
+  changed_when: false
+
+- name: Display Vault server pods
+  ansible.builtin.debug:
+    msg: "{{ vault_pods_table.stdout_lines }}"
+
+# Raft membership needs a token: $VAULT_TOKEN if set, else the root token from vault-init.json.
+- name: Resolve token for raft queries
+  ansible.builtin.set_fact:
+    vault_query_token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') or (vault_init_data.root_token | default('')) }}"
+  no_log: true
+
+- name: Find active Vault pod
+  ansible.builtin.command: >
+    {{ vault_kubectl }} get pods -l {{ vault_server_selector }},vault-active=true
+    -o jsonpath={.items[*].metadata.name}
+  register: vault_active_pod
+  changed_when: false
+
+- name: Read raft peers
+  when: vault_query_token | length > 0 and vault_active_pod.stdout | length > 0
+  block:
+    - name: Query raft peer list
+      ansible.builtin.command:
+        cmd: >-
+          {{ vault_kubectl }} exec -i {{ vault_active_pod.stdout.split() | first }} -c vault --
+          sh -c 'read -r VAULT_TOKEN; export VAULT_TOKEN; vault operator raft list-peers -format=json'
+        stdin: "{{ vault_query_token }}"
+      register: vault_raft_peers
+      # Followers join as non-voters and autopilot promotes them after stabilization.
+      until: >-
+        not (vault_wait_for_voters | default(false)) or (
+          vault_raft_peers.rc == 0 and
+          (vault_raft_peers.stdout | from_json).data.config.servers | selectattr('voter') | list | length == vault_replicas
+        )
+      retries: 24
+      delay: 5
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Display raft peers
+      ansible.builtin.debug:
+        msg: "{{ (vault_raft_peers.stdout | from_json).data.config.servers if vault_raft_peers.rc == 0 else vault_raft_peers.stderr }}"
+
+    - name: Fail when raft peers are not all voters
+      ansible.builtin.fail:
+        msg: "Expected {{ vault_replicas }} raft voters. Check `make vault-status` and the pod logs."
+      when:
+        - vault_wait_for_voters | default(false)
+        - vault_raft_peers.rc != 0 or
+          (vault_raft_peers.stdout | from_json).data.config.servers | selectattr('voter') | list | length != vault_replicas
+
+- name: Note when raft peers were not queried
+  ansible.builtin.debug:
+    msg: >-
+      Raft peers not shown: {{ 'no active (unsealed) Vault pod' if vault_active_pod.stdout | length == 0
+      else 'no token (set VAULT_TOKEN or restore ' ~ vault_init_file ~ ')' }}.
+  when: vault_query_token | length == 0 or vault_active_pod.stdout | length == 0

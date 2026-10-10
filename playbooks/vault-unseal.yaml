@@ -1,0 +1,21 @@
+---
+# Run after any Vault pod restart (node reboot, upgrade, eviction): pods come back sealed.
+- name: Unseal HashiCorp Vault pods
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Load unseal keys
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: load_keys.yaml
+
+    - name: Unseal sealed pods
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: unseal.yaml
+
+    - name: Show Vault cluster status
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: status.yaml

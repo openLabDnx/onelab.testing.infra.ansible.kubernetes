@@ -1,0 +1,75 @@
+# Vault Helm values (Managed by Ansible)
+fullnameOverride: "{{ vault_release_name }}"
+
+global:
+  enabled: true
+  tlsDisable: false
+
+injector:
+  enabled: {{ vault_injector_enabled | bool | lower }}
+  replicas: {{ vault_injector_replicas }}
+
+server:
+  image:
+    repository: "hashicorp/vault"
+    tag: "{{ vault_version }}"
+
+  resources:
+    {{ vault_server_resources | to_nice_yaml(indent=2) | trim | indent(4) }}
+
+  extraEnvironmentVars:
+    VAULT_CACERT: "/vault/userconfig/{{ vault_tls_secret_name }}/ca.crt"
+
+  volumes:
+    - name: {{ vault_tls_secret_name }}
+      secret:
+        secretName: {{ vault_tls_secret_name }}
+        defaultMode: 420
+  volumeMounts:
+    - name: {{ vault_tls_secret_name }}
+      mountPath: "/vault/userconfig/{{ vault_tls_secret_name }}"
+      readOnly: true
+
+  dataStorage:
+    enabled: true
+    size: "{{ vault_data_size }}"
+    storageClass: "{{ vault_storage_class }}"
+
+  ha:
+    enabled: true
+    replicas: {{ vault_replicas }}
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = true
+        cluster_name = "autofik-vault"
+
+        listener "tcp" {
+          address         = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_disable     = 0
+          tls_cert_file   = "/vault/userconfig/{{ vault_tls_secret_name }}/tls.crt"
+          tls_key_file    = "/vault/userconfig/{{ vault_tls_secret_name }}/tls.key"
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+{% for i in range(vault_replicas) %}
+
+          retry_join {
+            leader_api_addr     = "https://{{ vault_release_name }}-{{ i }}.{{ vault_release_name }}-internal:8200"
+            leader_ca_cert_file = "/vault/userconfig/{{ vault_tls_secret_name }}/ca.crt"
+          }
+{% endfor %}
+        }
+
+        service_registration "kubernetes" {}
+
+ui:
+  enabled: true
+  activeVaultPodOnly: true
+  serviceType: "{{ vault_ui_service_type }}"
+{% if vault_ui_service_type == 'NodePort' %}
+  serviceNodePort: {{ vault_ui_node_port }}
+{% endif %}
