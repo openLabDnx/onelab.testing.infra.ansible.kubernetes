@@ -1,0 +1,6 @@
+---
+# Master Orchestration Playbook for RKE2 Kubernetes HA Cluster
+- import_playbook: playbooks/01-prerequisites.yaml
+- import_playbook: playbooks/02-rke2-server.yaml
+- import_playbook: playbooks/03-rke2-agent.yaml
+- import_playbook: playbooks/04-verify.yaml

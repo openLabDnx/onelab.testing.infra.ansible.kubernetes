@@ -1,0 +1,7 @@
+---
+- name: Prepare all nodes for RKE2 Kubernetes cluster
+  hosts: rke2_cluster
+  become: yes
+  gather_facts: yes
+  roles:
+    - common

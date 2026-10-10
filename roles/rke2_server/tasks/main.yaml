@@ -1,0 +1,111 @@
+---
+- name: Ensure RKE2 configuration directory exists
+  ansible.builtin.file:
+    path: "{{ rke2_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Render RKE2 server config.yaml
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ rke2_config_dir }}/config.yaml"
+    mode: "0600"
+    owner: root
+    group: root
+  notify: Restart rke2-server
+
+- name: Check if RKE2 binary is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/rke2
+  register: rke2_binary
+
+- name: Download and install RKE2 server
+  ansible.builtin.shell: |
+    curl -sfL https://get.rke2.io | \
+    INSTALL_RKE2_TYPE="server" \
+    INSTALL_RKE2_CHANNEL="{{ rke2_channel }}" \
+    {% if rke2_version | length > 0 %}INSTALL_RKE2_VERSION="{{ rke2_version }}"{% endif %} \
+    sh -
+  args:
+    creates: /usr/local/bin/rke2
+  when: not rke2_binary.stat.exists
+
+- name: Enable and start rke2-server systemd service
+  ansible.builtin.systemd:
+    name: "{{ rke2_service_name }}"
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Wait for RKE2 Supervisor port 9345 to become available
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 9345
+    timeout: 300
+    delay: 10
+
+- name: Wait for Kubernetes API Server port 6443 to become available
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 6443
+    timeout: 300
+    delay: 5
+
+- name: Wait for kubeconfig to be generated
+  ansible.builtin.wait_for:
+    path: "{{ rke2_kubeconfig_path }}"
+    timeout: 180
+
+- name: Create symlinks for kubectl, crictl, and ctr
+  ansible.builtin.file:
+    src: "/var/lib/rancher/rke2/bin/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    state: link
+    force: yes
+  loop:
+    - kubectl
+    - crictl
+    - ctr
+  ignore_errors: true
+
+- name: Configure environment variables for shell sessions
+  ansible.builtin.copy:
+    dest: /etc/profile.d/rke2.sh
+    content: |
+      export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+      export PATH=$PATH:/var/lib/rancher/rke2/bin
+    mode: "0644"
+
+- name: Wait for master node to report Ready status
+  ansible.builtin.shell: |
+    /var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }} get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+  register: node_status
+  until: node_status.stdout == "True"
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Fetch kubeconfig to local management machine
+  when: inventory_hostname == groups['rke2_servers'][0]
+  block:
+    - name: Ensure local kubeconfig directory exists
+      ansible.builtin.file:
+        path: "{{ inventory_dir }}/../kubeconfig"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch kubeconfig file from master
+      ansible.builtin.fetch:
+        src: "{{ rke2_kubeconfig_path }}"
+        dest: "{{ inventory_dir }}/../kubeconfig/autofik-rke2.yaml"
+        flat: yes
+
+    - name: Update cluster server IP in local kubeconfig
+      ansible.builtin.replace:
+        path: "{{ inventory_dir }}/../kubeconfig/autofik-rke2.yaml"
+        regexp: 'https://127.0.0.1:6443'
+        replace: "https://{{ ansible_host }}:6443"
+      delegate_to: localhost
+      become: false

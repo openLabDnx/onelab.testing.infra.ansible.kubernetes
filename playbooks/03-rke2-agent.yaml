@@ -1,0 +1,20 @@
+---
+- name: Deploy RKE2 Worker Nodes (Agents)
+  hosts: rke2_agents
+  become: yes
+  gather_facts: yes
+  roles:
+    - rke2_agent
+
+- name: Label RKE2 Worker Nodes with Worker Role
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Apply node-role.kubernetes.io/worker label to worker nodes
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml
+        label node {{ item }} node-role.kubernetes.io/worker=worker --overwrite
+      loop: "{{ groups['rke2_agents'] }}"
+      register: label_res
+      changed_when: "'labeled' in label_res.stdout"

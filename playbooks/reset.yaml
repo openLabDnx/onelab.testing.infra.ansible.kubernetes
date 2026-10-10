@@ -1,0 +1,44 @@
+---
+- name: Reset / Teardown RKE2 Cluster (Cleanup)
+  hosts: rke2_cluster
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Check if rke2-agent uninstall script exists
+      ansible.builtin.stat:
+        path: /usr/local/bin/rke2-agent-uninstall.sh
+      register: agent_uninstall
+
+    - name: Run rke2-agent-uninstall.sh
+      ansible.builtin.command: /usr/local/bin/rke2-agent-uninstall.sh
+      when: agent_uninstall.stat.exists
+
+    - name: Check if rke2-server uninstall script exists
+      ansible.builtin.stat:
+        path: /usr/local/bin/rke2-uninstall.sh
+      register: server_uninstall
+
+    - name: Run rke2-uninstall.sh
+      ansible.builtin.command: /usr/local/bin/rke2-uninstall.sh
+      when: server_uninstall.stat.exists
+
+    - name: Remove leftover RKE2 directories and files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/rancher
+        - /var/lib/rancher
+        - /var/lib/kubelet
+        - /etc/profile.d/rke2.sh
+        - /usr/local/bin/kubectl
+        - /usr/local/bin/crictl
+        - /usr/local/bin/ctr
+
+    - name: Clean CNI network interfaces and iptables
+      ansible.builtin.shell: |
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete cni0 2>/dev/null || true
+        iptables -F || true
+        iptables -t nat -F || true
+      changed_when: false

@@ -1,0 +1,6 @@
+# RKE2 Agent (Worker) Configuration (Managed by Ansible)
+server: "{{ rke2_server_url }}"
+token: "{{ rke2_token }}"
+
+node-ip: "{{ node_ip | default(ansible_host) }}"
+node-external-ip: "{{ node_external_ip | default(ansible_host) }}"

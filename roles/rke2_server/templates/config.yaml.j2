@@ -1,0 +1,28 @@
+# RKE2 Server Configuration (Managed by Ansible)
+{% if inventory_hostname != groups['rke2_servers'][0] %}
+server: {{ rke2_server_url }}
+{% endif %}
+token: "{{ rke2_token }}"
+
+write-kubeconfig-mode: "{{ rke2_write_kubeconfig_mode }}"
+
+node-ip: "{{ node_ip | default(ansible_host) }}"
+node-external-ip: "{{ node_external_ip | default(ansible_host) }}"
+
+cluster-cidr: "{{ cluster_cidr }}"
+service-cidr: "{{ service_cidr }}"
+cluster-dns: "{{ cluster_dns }}"
+
+cni: "{{ rke2_cni }}"
+
+tls-san:
+{% for san in rke2_tls_san %}
+  - "{{ san }}"
+{% endfor %}
+
+{% if rke2_disable is defined and rke2_disable | length > 0 %}
+disable:
+{% for component in rke2_disable %}
+  - "{{ component }}"
+{% endfor %}
+{% endif %}

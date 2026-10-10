@@ -1,0 +1,72 @@
+# Global RKE2 Cluster Configuration
+ansible_python_interpreter: /usr/bin/python3
+
+# RKE2 Version / Channel
+# You can specify exact version (e.g., "v1.30.5+rke2r1") or channel (e.g., "v1.30" or "stable")
+rke2_channel: "stable"
+rke2_version: "" # Leave empty to fetch latest in channel, or specify like "v1.30.5+rke2r1"
+
+# Cluster Shared Secret Token for node join & HA control plane sync
+rke2_token: "AutofikK8sSecureHAClusterToken2026"
+
+# CNI Provider: canal (default), calico, cilium, or flannel
+rke2_cni: "canal"
+
+# Primary control plane URL (supervisor port 9345)
+rke2_primary_server_host: "{{ hostvars[groups['rke2_servers'][0]]['ansible_host'] }}"
+rke2_server_url: "https://{{ rke2_primary_server_host }}:9345"
+rke2_api_server_url: "https://{{ rke2_primary_server_host }}:6443"
+
+# Networking CIDRs
+cluster_cidr: "10.42.0.0/16"
+service_cidr: "10.43.0.0/16"
+cluster_dns: "10.43.0.10"
+
+# TLS Subject Alternative Names (SANs) for the API server certificate
+rke2_tls_san:
+  - "{{ rke2_primary_server_host }}"
+  - "169.58.118.85"
+  - "169.58.118.125"
+  - "46.250.224.184"
+  - "127.0.0.1"
+  - "localhost"
+  - "autofik-master-svr-ram-12gb"
+  - "kubernetes"
+  - "kubernetes.default"
+  - "kubernetes.default.svc"
+  - "kubernetes.default.svc.cluster.local"
+
+# Directories
+rke2_config_dir: "/etc/rancher/rke2"
+rke2_data_dir: "/var/lib/rancher/rke2"
+rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+local_kubeconfig_path: "{{ playbook_dir }}/kubeconfig/autofik-rke2.yaml"
+
+# Packages required on Linux nodes
+common_packages:
+  - curl
+  - wget
+  - tar
+  - socat
+  - conntrack
+  - ipset
+  - iptables
+  - jq
+  - net-tools
+  - ca-certificates
+  - software-properties-common
+  - systemd-timesyncd
+
+# Kernel modules to load
+required_kernel_modules:
+  - overlay
+  - br_netfilter
+
+# Sysctl parameters
+required_sysctl_params:
+  net.bridge.bridge-nf-call-iptables: 1
+  net.bridge.bridge-nf-call-ip6tables: 1
+  net.ipv4.ip_forward: 1
+  vm.max_map_count: 262144
+  fs.inotify.max_user_instances: 8192
+  fs.inotify.max_user_watches: 524288

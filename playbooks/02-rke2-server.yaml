@@ -1,0 +1,15 @@
+---
+- name: Deploy Primary RKE2 Control-Plane Server
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: yes
+  roles:
+    - rke2_server
+
+- name: Deploy Additional HA RKE2 Control-Plane Servers (if configured)
+  hosts: "{{ (groups['rke2_servers'][1:]) if (groups['rke2_servers'] | length > 1) else [] }}"
+  become: yes
+  gather_facts: yes
+  serial: 1
+  roles:
+    - rke2_server
