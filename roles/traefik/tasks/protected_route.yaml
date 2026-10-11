@@ -1,0 +1,9 @@
+---
+# Publish a Service on a *.testing host behind authentik forward-auth.
+# in: route_name, route_namespace, route_host, route_service, route_port
+- name: "Publish {{ route_host }} behind authentik"
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'protected-route.yaml.j2') }}"
+  register: traefik_route_apply
+  changed_when: traefik_route_apply.stdout is search('(created|configured)')

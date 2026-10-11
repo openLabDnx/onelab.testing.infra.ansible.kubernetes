@@ -1,0 +1,19 @@
+# App users (Managed by Ansible). Strimzi writes each password to a Secret of
+# the same name (keys: password, sasl.jaas.config).
+{% for u in kafka_users %}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaUser
+metadata:
+  name: {{ u.name }}
+  namespace: {{ kafka_namespace }}
+  labels:
+    strimzi.io/cluster: {{ kafka_cluster_name }}
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      {{ u.acls | to_nice_yaml(indent=2) | trim | indent(6) }}
+{% endfor %}

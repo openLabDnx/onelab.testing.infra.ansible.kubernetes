@@ -1,0 +1,8 @@
+---
+# Re-publish and apply the platform blueprint only (used when another role adds
+# a forward-auth app, e.g. the messaging playbook).
+- name: Publish the platform blueprint
+  ansible.builtin.import_tasks: blueprint_publish.yaml
+
+- name: Apply the platform blueprint
+  ansible.builtin.import_tasks: blueprint_apply.yaml

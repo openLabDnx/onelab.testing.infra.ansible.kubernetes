@@ -1,0 +1,106 @@
+---
+- name: Generate and persist the Grafana break-glass password
+  ansible.builtin.set_fact:
+    grafana_admin_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/grafana_admin_password chars=ascii_letters,digits length=32') }}"
+  no_log: true
+
+# The namespace must exist before a server-side diff of objects inside it.
+- name: Create observability namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ observability_namespace }}
+  register: monitoring_ns_apply
+  changed_when: monitoring_ns_apply.stdout is search('(created|configured)')
+
+- name: Create Grafana Secrets
+  ansible.builtin.include_tasks: apply.yaml
+  vars:
+    ssa_label: Grafana Secrets
+    ssa_manifest: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: grafana-admin
+        namespace: {{ observability_namespace }}
+      data:
+        admin-user: {{ grafana_admin_user | b64encode }}
+        admin-password: {{ grafana_admin_password | b64encode }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: grafana-oidc
+        namespace: {{ observability_namespace }}
+      data:
+        client-secret: {{ grafana_oidc_client_secret | b64encode }}
+  no_log: true
+
+- name: Install / upgrade kube-prometheus-stack
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: kube-prometheus-stack
+    release_namespace: "{{ observability_namespace }}"
+    chart_repo_url: "{{ kube_prometheus_stack_chart_repo_url }}"
+    chart_ref: kube-prometheus-stack
+    chart_version: "{{ kube_prometheus_stack_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # return right away and poll the rollouts below (see roles/authentik)
+    wait: false
+
+- name: Wait for the Prometheus operator, Grafana and kube-state-metrics
+  ansible.builtin.command: "{{ monitoring_kubectl }} rollout status deployment/{{ item }} --timeout=600s"
+  loop:
+    - kube-prometheus-stack-operator
+    - kube-prometheus-stack-grafana
+    - kube-prometheus-stack-kube-state-metrics
+  changed_when: false
+
+- name: Wait for Prometheus
+  ansible.builtin.command: "{{ monitoring_kubectl }} rollout status statefulset/prometheus-kube-prometheus-stack-prometheus --timeout=600s"
+  register: monitoring_prom_rollout
+  until: monitoring_prom_rollout.rc == 0
+  retries: 12
+  delay: 10
+  changed_when: false
+
+# --- what to scrape, what to alert on, what to show -------------------------
+- name: Kafka and RabbitMQ scrape configs
+  ansible.builtin.include_tasks: apply.yaml
+  vars:
+    ssa_label: PodMonitors / ServiceMonitor
+    ssa_manifest: "{{ lookup('ansible.builtin.template', 'monitors.yaml.j2') }}"
+
+- name: Strimzi alert and recording rules
+  ansible.builtin.include_tasks: apply.yaml
+  vars:
+    ssa_label: "rules {{ item }}"
+    ssa_manifest: >-
+      {{ lookup('ansible.builtin.url', strimzi_rules_base_url ~ '/' ~ item, split_lines=False) | from_yaml
+         | combine({'metadata': {'namespace': kafka_namespace}}, recursive=true) | to_json }}
+  loop: "{{ strimzi_rules }}"
+
+# Grafana's sidecar loads every ConfigMap labelled grafana_dashboard=1; the
+# dashboards' ${DS_PROMETHEUS} input points at the stack's Prometheus datasource.
+- name: Grafana dashboards
+  ansible.builtin.include_tasks: apply.yaml
+  vars:
+    ssa_label: "dashboard {{ item.name }}"
+    ssa_manifest: >-
+      {{ {'apiVersion': 'v1', 'kind': 'ConfigMap',
+          'metadata': {'name': 'dashboard-' ~ item.name, 'namespace': observability_namespace,
+                       'labels': {'grafana_dashboard': '1'}, 'annotations': {'grafana_folder': item.folder}},
+          'data': {item.name ~ '.json': lookup('ansible.builtin.url', item.url, split_lines=False) | replace('${DS_PROMETHEUS}', 'prometheus')}}
+         | to_json }}
+  loop: "{{ monitoring_dashboards }}"
+  loop_control:
+    label: "{{ item.folder }}/{{ item.name }}"
+
+- name: Verify monitoring
+  ansible.builtin.import_tasks: verify.yaml

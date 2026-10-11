@@ -56,7 +56,11 @@ autofik.infra.testing/
 │   ├── cnpg/                    # CloudNativePG operator
 │   ├── authentik/               # PostgreSQL cluster, authentik, SSO blueprint, forward-auth, backups
 │   ├── argocd/                  # Argo CD HA + authentik OIDC
-│   └── portainer/               # Portainer CE + authentik OAuth
+│   ├── portainer/               # Portainer CE + authentik OAuth
+│   ├── cert_manager/            # cert-manager (needed by the RabbitMQ operator)
+│   ├── rabbitmq/                # RabbitMQ Cluster Operator, 3-node cluster, users, policy, UI route
+│   ├── kafka/                   # Strimzi, Kafka KRaft x3, topics, users/ACLs, kafbat UI, metrics
+│   └── monitoring/              # kube-prometheus-stack, Grafana SSO, Kafka/RabbitMQ monitors, rules, dashboards
 │       ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
 │       ├── tasks/
 │       └── templates/cloudflared.yaml.j2
@@ -77,6 +81,8 @@ autofik.infra.testing/
 │   ├── apisix-status.yaml       # Gateway/etcd pods, HPA, etcd health, route counts
 │   ├── apisix-reset.yaml        # Destroy APISIX and its etcd data (asks to confirm)
 │   ├── 09-platform.yaml         # Traefik, CloudNativePG, authentik, Argo CD, Portainer (tags per part)
+│   ├── 10-messaging.yaml        # cert-manager, RabbitMQ, Kafka (tags per part)
+│   ├── 11-monitoring.yaml       # Prometheus + Grafana for Kafka/RabbitMQ (replaces Control Center)
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
@@ -366,6 +372,9 @@ Every UI is published under `*.testing.autofik.com`. The Cloudflare tunnel alrea
 | https://argocd.testing.autofik.com | Argo CD (GitOps) | **Log in via authentik**; break-glass `admin` / `secrets/platform/argocd_admin_password` |
 | https://portainer.testing.autofik.com | Portainer CE | **Login with OAuth** (authentik); break-glass `admin` / `secrets/platform/portainer_admin_password` |
 | https://traefik.testing.autofik.com/dashboard/ | Traefik dashboard | authentik forward-auth (no login of its own) |
+| https://rabbitmq.testing.autofik.com | RabbitMQ management | authentik forward-auth, then RabbitMQ `admin` |
+| https://kafka.testing.autofik.com | Kafka UI (kafbat, read-only) | authentik forward-auth |
+| https://grafana.testing.autofik.com | Grafana (Kafka/RabbitMQ/cluster dashboards) | **Sign in with authentik** |
 
 Only members of the authentik group **`platform-admins`** can open these apps (`akadmin` is in it); anyone else gets authentik's "Permission denied". Argo CD maps that group to `role:admin`. In Portainer, SSO users land in team `sso-users` **with no environment access**; usernames listed in `portainer_admin_users` (`roles/portainer/defaults/main.yaml`, default `akadmin`) are made Portainer administrators after their first SSO login and a re-run of `make portainer`.
 
@@ -392,6 +401,65 @@ master and worker2 share a data centre (~1 ms). **worker1 is ~160 ms away.** Nod
 2. Check SSO into Argo CD, then set `argocd_admin_enabled: false` in `roles/argocd/defaults/main.yaml` and run `make argocd`.
 3. Copy the latest authentik backup off the cluster from time to time:
    `kubectl -n authentik exec <pod with the PVC> -- ls /backups` (or restore with `pg_restore`).
+
+---
+
+## 📨 Messaging: RabbitMQ & Kafka
+
+Both run as **3-member clusters, one member per server**, so losing any one server loses no acknowledged message. They're internal (ClusterIP); only their admin UIs are published, behind authentik.
+
+| | RabbitMQ | Kafka |
+| :--- | :--- | :--- |
+| Software | RabbitMQ 4.3.5 via the RabbitMQ Cluster Operator v2.23.0 | Apache Kafka 4.2.1 (KRaft) via Strimzi 1.2.0 |
+| HA | 3 nodes, **quorum queues by default**, `pause_minority` | 3 broker+controller nodes, RF 3, `min.insync.replicas` 2 |
+| In-cluster address | `rabbitmq.rabbitmq.svc.cluster.local:5672`, vhost `/` | `kafka-kafka-bootstrap.kafka.svc:9092` (SASL_PLAINTEXT) or `:9093` (SASL_SSL) |
+| App login | own user per app: `booking`, `garages-cms`, `billing`, `subscription` (no management access) | own SCRAM-SHA-512 user per app with ACLs: `signal-of-service` (sos.*, mechanic.*), `sos-gateway` (read only) |
+| Credentials | Secret `rabbitmq-user-<app>` in `rabbitmq` (`uri`, `username`, `password`) | Secret `<user>` in `kafka` (`password`, `sasl.jaas.config`) |
+| Limits | 1 GiB per queue (`reject-publish`), publishers blocked below 2 GB free disk | 7 days and 512 MiB per partition, auto-create off |
+| Admin UI | https://rabbitmq.testing.autofik.com (authentik, then `admin` / `secrets/platform/rabbitmq_admin_password`) | https://kafka.testing.autofik.com (authentik; kafbat, **read-only**) |
+
+```bash
+make messaging   # cert-manager + RabbitMQ + Kafka, each ends with a smoke test (safe to re-run)
+make rabbitmq    # RabbitMQ only
+make kafka       # Kafka only
+```
+
+### Connecting the apps
+- **RabbitMQ:** replace the shared `admin` URI with the app's own: `RABBITMQ_URI` = `uri` from Secret `rabbitmq-user-<app>`. Declare queues durable, publish persistent messages, and use publisher confirms. New queues are quorum queues unless the app asks for `x-queue-type=classic`.
+- **Kafka (Spring, signal-of-service):** `KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.kafka.svc:9092`, `KAFKA_TOPIC_REPLICATION_FACTOR=3`, and
+  `spring.kafka.properties.security.protocol=SASL_PLAINTEXT`, `sasl.mechanism=SCRAM-SHA-512`, `sasl.jaas.config=<from Secret signal-of-service>`. Use `acks=all` (the Spring default) with idempotence on.
+- **Kafka (Go, sos-gateway):** `KAFKA_BROKERS=kafka-kafka-bootstrap.kafka.svc:9092`, `KAFKA_GROUP_PREFIX=sos-gateway`, SCRAM-SHA-512 with the `sos-gateway` user.
+- For encryption between nodes, use port **9093** (SASL_SSL) and trust the CA in Secret `kafka-cluster-ca-cert`.
+- Users, topics and ACLs live in `roles/rabbitmq/defaults/main.yaml` and `roles/kafka/defaults/main.yaml`. Add an app there and re-run.
+
+### Things to know
+- **worker1 is ~160 ms from the other servers.** Writes that must be confirmed by its replica take ~160 ms longer: Kafka `acks=all`, and RabbitMQ queues whose leader is on worker1. A third server in Europe would remove that delay; move the third member there.
+- **Passwords are reconciled to `secrets/platform/`** on every run. If a password file is missing while its Secret exists, the run stops instead of rotating the password. Restore the file first.
+- **Backups:** Kafka and RabbitMQ keep 3 copies but no off-cluster backup. Export RabbitMQ definitions (`rabbitmqctl export_definitions`) before big changes.
+
+---
+
+## 📈 Monitoring: Prometheus + Grafana (instead of Confluent Control Center)
+
+**Why not Confluent Control Center:** it's an enterprise-licensed component. On a 3-broker cluster it only runs as a 30-day trial, and then it no longer starts. Its metric dashboards also need Confluent Server brokers; this cluster runs Apache Kafka (Strimzi). See `production.md` MSG-01, option B, in the master repo.
+
+The free stack gives the same visibility:
+
+| What | Where |
+| :--- | :--- |
+| Grafana (dashboards, alerts) | https://grafana.testing.autofik.com: **Sign in with authentik** (`platform-admins` = Admin, others Viewer). Break-glass: `admin` / `secrets/platform/grafana_admin_password` |
+| Kafka dashboards (folder *Kafka*) | Strimzi Kafka (brokers, throughput, partitions), Strimzi KRaft (controller quorum), Strimzi Kafka Exporter (**consumer lag**, offsets), Strimzi Operators |
+| RabbitMQ dashboards (folder *RabbitMQ*) | RabbitMQ-Overview, RabbitMQ-Quorum-Queues-Raft |
+| Topics, consumer groups, messages | Kafka UI (kafbat): https://kafka.testing.autofik.com |
+| Alerts | Strimzi's rules (disk running out, under-replicated or offline partitions, consumer lag...) plus the Kubernetes defaults, in Grafana → Alerting |
+
+```bash
+make monitoring   # authentik SSO app, Kafka metrics, Prometheus + Grafana, dashboards (safe to re-run)
+```
+
+- **Prometheus:** 15 days or 18 GB of metrics on a 20 Gi `local-path-retain` volume, on the European nodes.
+- **No Alertmanager yet** (same as the master cluster): rules are evaluated and shown in Grafana, but nothing is sent. Add a receiver (Slack, email) and set `alertmanager.enabled: true` in `roles/monitoring/templates/values.yaml.j2`.
+- **Control-plane scraping is off:** RKE2 binds etcd, the scheduler, the controller-manager and kube-proxy to localhost, so those targets are disabled instead of showing as permanently down.
 
 ---
 

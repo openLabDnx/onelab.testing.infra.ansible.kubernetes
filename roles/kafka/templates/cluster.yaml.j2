@@ -1,0 +1,116 @@
+# Kafka cluster (Managed by Ansible)
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: main
+  namespace: {{ kafka_namespace }}
+  labels:
+    strimzi.io/cluster: {{ kafka_cluster_name }}
+spec:
+  replicas: {{ kafka_replicas }}
+  roles: [controller, broker]
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: {{ kafka_storage_size }}
+        class: {{ kafka_storage_class }}
+        deleteClaim: false
+        kraftMetadata: shared
+  resources:
+    {{ kafka_resources | to_nice_yaml(indent=2) | trim | indent(4) }}
+  jvmOptions:
+    "-Xms": {{ kafka_heap }}
+    "-Xmx": {{ kafka_heap }}
+  template:
+    pod:
+      # one node per server: losing a server keeps 2 of 3 replicas and the KRaft quorum
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/cluster: {{ kafka_cluster_name }}
+                  strimzi.io/pool-name: main
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 120
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: {{ kafka_cluster_name }}
+  namespace: {{ kafka_namespace }}
+spec:
+  kafka:
+    version: {{ kafka_version }}
+    listeners:
+      # SCRAM on both; 9093 also encrypts (node-to-node pod traffic is not encrypted)
+      - name: scram
+        port: 9092
+        type: internal
+        tls: false
+        authentication:
+          type: scram-sha-512
+      - name: scramtls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: scram-sha-512
+    authorization:
+      type: simple
+    # broker.rack = node site (eu / ap); replicas spread over sites, and consumers
+    # that set client.rack read from the nearest replica
+    rack:
+      topologyKey: {{ platform_node_site_label }}
+{% if kafka_metrics_enabled %}
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+{% endif %}
+    config:
+      default.replication.factor: {{ kafka_replication_factor }}
+      min.insync.replicas: {{ kafka_min_insync_replicas }}
+      offsets.topic.replication.factor: {{ kafka_replication_factor }}
+      transaction.state.log.replication.factor: {{ kafka_replication_factor }}
+      transaction.state.log.min.isr: {{ kafka_min_insync_replicas }}
+      auto.create.topics.enable: false
+      log.retention.hours: {{ kafka_log_retention_hours }}
+      log.retention.bytes: {{ kafka_log_retention_bytes }}
+      replica.selector.class: org.apache.kafka.common.replica.RackAwareReplicaSelector
+{% if kafka_metrics_enabled %}
+  # consumer lag and topic offsets for Prometheus
+  kafkaExporter:
+    topicRegex: ".*"
+    groupRegex: ".*"
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 256Mi }
+    template:
+      pod:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: {{ platform_node_site_label }}
+                      operator: In
+                      values: [{{ platform_primary_site }}]
+{% endif %}
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+    template:
+      pod:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: {{ platform_node_site_label }}
+                      operator: In
+                      values: [{{ platform_primary_site }}]

@@ -1,0 +1,65 @@
+---
+# Defaults for kafka role
+# Apache Kafka (KRaft) through the Strimzi operator: free for production, unlike
+# Confluent Server beyond one broker (production.md MSG-01/02/04/05/06).
+strimzi_chart_repo_url: "https://strimzi.io/charts/"
+strimzi_chart_version: "1.2.0"
+kafka_version: "4.2.1"
+kafka_cluster_name: "kafka"
+
+# One combined broker+controller per server: survives losing any server with no
+# acknowledged data lost (RF 3, min.insync.replicas 2, producers with acks=all).
+kafka_replicas: 3
+kafka_storage_class: "local-path-retain"
+kafka_storage_size: "20Gi"
+kafka_heap: "1g"
+kafka_resources:
+  requests: { cpu: 250m, memory: 2Gi }
+  limits: { memory: 2Gi }
+kafka_replication_factor: 3
+kafka_min_insync_replicas: 2
+kafka_log_retention_hours: 168                     # 7 days
+kafka_log_retention_bytes: 536870912               # and at most 512 MiB per partition replica
+
+# Topics the apps use, declared here (auto-create is off). signal-of-service also
+# creates them itself; an existing topic is left as is.
+kafka_topic_partitions: 3
+kafka_topics:
+  - mechanic.location.updated
+  - sos.created
+  - sos.status.updated
+  - sos.bid.created
+  - sos.bid.accepted
+  - sos.bid.rejected
+  - sos.bid.cancelled
+  - sos.media.uploaded
+  - sos.notification
+  - sos.dlq
+
+# One SCRAM user per app, ACLs limited to its topics and consumer groups.
+kafka_users:
+  - name: signal-of-service
+    acls:
+      - { resource: { type: topic, name: "sos.", patternType: prefix }, operations: [All] }
+      - { resource: { type: topic, name: "mechanic.", patternType: prefix }, operations: [All] }
+      - { resource: { type: group, name: "sos-", patternType: prefix }, operations: [All] }
+  - name: sos-gateway                               # reads only; set KAFKA_GROUP_PREFIX=sos-gateway
+    acls:
+      - { resource: { type: topic, name: "sos.", patternType: prefix }, operations: [Read, Describe] }
+      - { resource: { type: topic, name: "mechanic.", patternType: prefix }, operations: [Read, Describe] }
+      - { resource: { type: group, name: "sos-gateway", patternType: prefix }, operations: [Read, Describe] }
+  - name: kafka-ui                                  # read-only browser
+    acls:
+      - { resource: { type: topic, name: "*", patternType: literal }, operations: [Read, Describe, DescribeConfigs] }
+      - { resource: { type: group, name: "*", patternType: literal }, operations: [Read, Describe] }
+      - { resource: { type: cluster }, operations: [Describe, DescribeConfigs] }
+
+# Prometheus metrics (JMX exporter rules from Strimzi's examples at the operator's
+# version) and Kafka Exporter for consumer lag; scraped by roles/monitoring.
+kafka_metrics_enabled: true
+kafka_metrics_rules_url: "https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/{{ strimzi_chart_version }}/packaging/examples/metrics/kafka-metrics.yaml"
+
+kafka_ui_image: "ghcr.io/kafbat/kafka-ui:v1.5.0"
+kafka_ui_replicas: 2
+
+kafka_kubectl: "{{ cluster_kubectl }} -n {{ kafka_namespace }}"

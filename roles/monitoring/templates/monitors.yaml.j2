@@ -1,0 +1,85 @@
+# Scrape configs for Kafka (Strimzi) and RabbitMQ (Managed by Ansible)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kafka-resources
+  namespace: {{ kafka_namespace }}
+spec:
+  # brokers (JMX exporter)
+  selector:
+    matchLabels:
+      strimzi.io/kind: Kafka
+      strimzi.io/component-type: kafka
+  podMetricsEndpoints:
+    - path: /metrics
+      port: tcp-prometheus
+      relabelings:
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(strimzi_io_.+)
+          replacement: $1
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: kubernetes_pod_name
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node_name
+---
+# Kafka Exporter (consumer lag): one scrape walks every partition on every broker,
+# including the one ~160 ms away, so it takes several seconds; scrape it less often.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kafka-exporter
+  namespace: {{ kafka_namespace }}
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/kind: Kafka
+      strimzi.io/component-type: kafka-exporter
+  podMetricsEndpoints:
+    - path: /metrics
+      port: tcp-prometheus
+      interval: 60s
+      scrapeTimeout: 55s
+      relabelings:
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(strimzi_io_.+)
+          replacement: $1
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: kubernetes_pod_name
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: strimzi-cluster-operator
+  namespace: {{ kafka_namespace }}
+spec:
+  selector:
+    matchLabels: { strimzi.io/kind: cluster-operator }
+  podMetricsEndpoints:
+    - { path: /metrics, port: http }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: strimzi-entity-operator
+  namespace: {{ kafka_namespace }}
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/name: entity-operator }
+  podMetricsEndpoints:
+    - { path: /metrics, port: healthcheck-to }
+    - { path: /metrics, port: healthcheck-uo }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rabbitmq
+  namespace: {{ rabbitmq_namespace }}
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/component: rabbitmq }
+  endpoints:
+    - { port: prometheus, interval: 15s, scrapeTimeout: 14s }

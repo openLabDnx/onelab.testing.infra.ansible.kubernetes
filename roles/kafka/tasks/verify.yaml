@@ -1,0 +1,107 @@
+---
+- name: Show broker placement
+  ansible.builtin.command: >
+    {{ kafka_kubectl }} get pods -l strimzi.io/cluster={{ kafka_cluster_name }},strimzi.io/pool-name=main
+    -o custom-columns=POD:.metadata.name,READY:.status.containerStatuses[0].ready,NODE:.spec.nodeName --no-headers
+  register: kafka_pods
+  changed_when: false
+
+# Temporary user + topic, removed again at the end.
+- name: Create smoke-test user and topic
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaTopic
+      metadata:
+        name: ansible-smoke-check
+        labels: { strimzi.io/cluster: {{ kafka_cluster_name }} }
+      spec:
+        topicName: ansible-smoke.check
+        partitions: 1
+        replicas: {{ kafka_replication_factor }}
+      ---
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaUser
+      metadata:
+        name: ansible-smoke
+        labels: { strimzi.io/cluster: {{ kafka_cluster_name }} }
+      spec:
+        authentication: { type: scram-sha-512 }
+        authorization:
+          type: simple
+          acls:
+            - { resource: { type: topic, name: "ansible-smoke.", patternType: prefix }, operations: [All] }
+            - { resource: { type: group, name: "ansible-smoke.", patternType: prefix }, operations: [All] }
+  changed_when: false
+
+- name: Wait for the smoke-test user and topic
+  ansible.builtin.command: "{{ kafka_kubectl }} wait {{ item }} --for=condition=Ready --timeout=180s"
+  loop: [kafkatopic/ansible-smoke-check, kafkauser/ansible-smoke]
+  changed_when: false
+
+- name: Read client credentials
+  # single quotes: the command module's shlex split would eat the backslashes
+  ansible.builtin.command: "{{ kafka_kubectl }} get secret {{ item }} -o 'jsonpath={.data.sasl\\.jaas\\.config}'"
+  loop: [ansible-smoke, sos-gateway]
+  register: kafka_jaas
+  changed_when: false
+  no_log: true
+
+# Runs inside a broker with the Kafka CLI: produce (acks=all) and consume back as
+# the smoke user over SCRAM, show the replicas, and check that the read-only
+# sos-gateway user is refused when it tries to write.
+- name: Produce, consume and check ACLs
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} exec -i {{ kafka_cluster_name }}-main-0 -c kafka -- bash -s"
+    stdin: |
+      set -u
+      cd /opt/kafka/bin
+      umask 077
+      cfg() { printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=SCRAM-SHA-512\nsasl.jaas.config=%s\n' "$1" > "$2"; }
+      cfg '{{ kafka_jaas.results[0].stdout | b64decode }}' /tmp/smoke.properties
+      cfg '{{ kafka_jaas.results[1].stdout | b64decode }}' /tmp/gw.properties
+      MSG="hello-$(date +%s)"
+      # Kafka 4.2 CLI: --command-config / --command-property (the old names are deprecated)
+      echo "$MSG" | ./kafka-console-producer.sh --bootstrap-server localhost:9092 --command-config /tmp/smoke.properties \
+        --topic ansible-smoke.check --command-property acks=all 2>/tmp/p.err \
+        && echo "PRODUCE_OK" || { echo "PRODUCE_FAIL"; grep -iE 'error|exception' /tmp/p.err | head -3 | sed 's/^/PRODUCE_FAIL /'; }
+      GOT=$(./kafka-console-consumer.sh --bootstrap-server localhost:9092 --command-config /tmp/smoke.properties \
+        --topic ansible-smoke.check --group ansible-smoke.g --from-beginning --max-messages 1 --timeout-ms 30000 2>/dev/null)
+      [ "$GOT" = "$MSG" ] && echo "CONSUME_OK" || echo "CONSUME_FAIL got='$GOT'"
+      ./kafka-topics.sh --bootstrap-server localhost:9092 --command-config /tmp/smoke.properties \
+        --describe --topic ansible-smoke.check 2>/dev/null | grep -o 'Replicas: [0-9,]*.*Isr: [0-9,]*' | sed 's/^/TOPIC /'
+      echo "denied?" | timeout 40 ./kafka-console-producer.sh --bootstrap-server localhost:9092 --command-config /tmp/gw.properties \
+        --topic sos.created --command-property max.block.ms=15000 --command-property enable.idempotence=false > /tmp/gw.out 2>&1
+      # idempotence off so the topic ACL itself is tested (not the producer-id check)
+      grep -q 'TopicAuthorizationException' /tmp/gw.out && echo "ACL_DENIED_OK" || { echo "ACL_NOT_DENIED"; tail -3 /tmp/gw.out; }
+      rm -f /tmp/smoke.properties /tmp/gw.properties /tmp/gw.out /tmp/p.err
+  register: kafka_smoke
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Remove smoke-test user and topic
+  ansible.builtin.command: "{{ kafka_kubectl }} delete kafkatopic/ansible-smoke-check kafkauser/ansible-smoke --ignore-not-found"
+  changed_when: false
+
+- name: Display Kafka smoke test
+  ansible.builtin.debug:
+    msg: "{{ kafka_pods.stdout_lines + (kafka_smoke.stdout_lines | select('search', '^(PRODUCE|CONSUME|TOPIC|ACL)') | list) + (kafka_smoke.stdout_lines | select('search', 'Exception|ERROR') | list) }}"
+
+- name: Fail when the smoke test failed
+  ansible.builtin.assert:
+    that:
+      - "'PRODUCE_OK' in kafka_smoke.stdout"
+      - "'CONSUME_OK' in kafka_smoke.stdout"
+      - "'ACL_DENIED_OK' in kafka_smoke.stdout"
+    fail_msg: "Kafka smoke test failed: {{ kafka_smoke.stdout_lines | select('search', 'FAIL|NOT') | list }}"
+    quiet: true
+
+- name: Display Kafka summary
+  ansible.builtin.debug:
+    msg:
+      - "Kafka {{ kafka_version }}: {{ kafka_replicas }} brokers/controllers (KRaft), RF {{ kafka_replication_factor }}, min.insync.replicas {{ kafka_min_insync_replicas }}"
+      - "Bootstrap: {{ kafka_cluster_name }}-kafka-bootstrap.{{ kafka_namespace }}.svc:9092 (SASL_PLAINTEXT) or :9093 (SASL_SSL, CA in Secret {{ kafka_cluster_name }}-cluster-ca-cert), SCRAM-SHA-512"
+      - "App users: {{ kafka_users | map(attribute='name') | join(', ') }} -> Secrets of the same name (password, sasl.jaas.config)"
+      - "Kafka UI (read-only): https://{{ kafka_ui_host }}/ (authentik)"

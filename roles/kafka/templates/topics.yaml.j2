@@ -1,0 +1,19 @@
+# App topics (Managed by Ansible)
+{% for t in kafka_topics %}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: {{ t | replace('.', '-') }}
+  namespace: {{ kafka_namespace }}
+  labels:
+    strimzi.io/cluster: {{ kafka_cluster_name }}
+spec:
+  topicName: {{ t }}
+  partitions: {{ kafka_topic_partitions }}
+  replicas: {{ kafka_replication_factor }}
+  config:
+    min.insync.replicas: {{ kafka_min_insync_replicas }}
+    retention.ms: {{ kafka_log_retention_hours * 3600000 }}
+    retention.bytes: {{ kafka_log_retention_bytes }}
+{% endfor %}

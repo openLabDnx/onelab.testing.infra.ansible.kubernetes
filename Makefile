@@ -2,7 +2,7 @@
 	storage vault vault-unseal vault-status vault-ui vault-reset \
 	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
 	apisix apisix-status apisix-admin apisix-reset \
-	platform traefik authentik argocd portainer
+	platform traefik authentik argocd portainer messaging rabbitmq kafka monitoring
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -44,6 +44,11 @@ help:
 	@echo "make authentik  : PostgreSQL (CloudNativePG x3) + authentik + SSO blueprint"
 	@echo "make argocd     : Argo CD HA with authentik SSO"
 	@echo "make portainer  : Portainer with authentik SSO"
+	@echo "-----------------------------------------------------------------"
+	@echo "make messaging  : cert-manager + RabbitMQ + Kafka (needs make platform)"
+	@echo "make rabbitmq   : RabbitMQ 3-node cluster, app users, UI behind SSO"
+	@echo "make kafka      : Kafka (Strimzi, KRaft x3), topics, users, Kafka UI behind SSO"
+	@echo "make monitoring : Prometheus + Grafana (SSO), Kafka/RabbitMQ dashboards and alerts"
 	@echo "================================================================="
 
 check:
@@ -129,6 +134,18 @@ argocd:
 
 portainer:
 	ansible-playbook playbooks/09-platform.yaml --tags portainer
+
+messaging:
+	ansible-playbook playbooks/10-messaging.yaml
+
+rabbitmq:
+	ansible-playbook playbooks/10-messaging.yaml --tags rabbitmq
+
+kafka:
+	ansible-playbook playbooks/10-messaging.yaml --tags kafka
+
+monitoring:
+	ansible-playbook playbooks/11-monitoring.yaml
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

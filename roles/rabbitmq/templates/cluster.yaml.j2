@@ -1,0 +1,35 @@
+# RabbitMQ cluster (Managed by Ansible)
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: {{ rabbitmq_cluster_name }}
+  namespace: {{ rabbitmq_namespace }}
+spec:
+  replicas: {{ rabbitmq_replicas }}
+  image: {{ rabbitmq_image }}
+  resources:
+    requests:
+      cpu: {{ rabbitmq_cpu_request }}
+      memory: {{ rabbitmq_memory }}
+    limits:
+      memory: {{ rabbitmq_memory }}
+  persistence:
+    storageClassName: {{ rabbitmq_storage_class }}
+    storage: {{ rabbitmq_storage_size }}
+  # one node per server: losing a server keeps a quorum (2 of 3)
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ rabbitmq_cluster_name }}
+          topologyKey: kubernetes.io/hostname
+  # long enough for quorum queues to hand over leadership on a planned stop
+  terminationGracePeriodSeconds: 300
+  # RabbitMQ refuses to start the next version unless all stable flags are on
+  autoEnableAllFeatureFlags: true
+  rabbitmq:
+    additionalConfig: |
+      default_queue_type = quorum
+      disk_free_limit.absolute = {{ rabbitmq_disk_free_limit }}
+      cluster_partition_handling = pause_minority

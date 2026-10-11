@@ -1,0 +1,109 @@
+---
+# The management API is reached on the Service's ClusterIP from the server node,
+# authenticated as the operator's default user (stays internal, never shared).
+- name: Get RabbitMQ service address
+  ansible.builtin.command: "{{ rabbitmq_kubectl }} get svc {{ rabbitmq_cluster_name }} -o jsonpath={.spec.clusterIP}"
+  register: rabbitmq_svc_ip
+  changed_when: false
+
+- name: Read the operator's default user
+  ansible.builtin.command: "{{ rabbitmq_kubectl }} get secret {{ rabbitmq_cluster_name }}-default-user -o json"
+  register: rabbitmq_default_user_raw
+  changed_when: false
+  no_log: true
+
+- name: Set management API facts
+  ansible.builtin.set_fact:
+    rabbitmq_api: "http://{{ rabbitmq_svc_ip.stdout }}:15672/api"
+    rabbitmq_api_user: "{{ (rabbitmq_default_user_raw.stdout | from_json).data.username | b64decode }}"
+    rabbitmq_api_password: "{{ (rabbitmq_default_user_raw.stdout | from_json).data.password | b64decode }}"
+    rabbitmq_vhost_enc: "{{ rabbitmq_vhost | urlencode | replace('/', '%2F') }}"
+  no_log: true
+
+- name: Read existing users
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/users"
+    url_username: "{{ rabbitmq_api_user }}"
+    url_password: "{{ rabbitmq_api_password }}"
+    force_basic_auth: true
+  register: rabbitmq_users_before
+  until: rabbitmq_users_before.status == 200
+  retries: 12
+  delay: 5
+  no_log: true
+
+# PUT every run: the password always equals the stored file, so drift is undone.
+# "changed" only when the user is new or its tags differ.
+- name: Ensure users (admin for people, one per app)
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/users/{{ item.name }}"
+    method: PUT
+    url_username: "{{ rabbitmq_api_user }}"
+    url_password: "{{ rabbitmq_api_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      password: "{{ rabbitmq_passwords[item.name] }}"
+      tags: "{{ item.tags }}"
+    status_code: [201, 204]
+  loop: "{{ [{'name': rabbitmq_admin_user, 'tags': 'administrator'}] + (rabbitmq_app_users | map('community.general.dict_kv', 'name') | map('combine', {'tags': ''}) | list) }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.tags or 'no management access' }})"
+  changed_when: >-
+    item.name not in (rabbitmq_users_before.json | map(attribute='name') | list)
+    or ((rabbitmq_users_before.json | selectattr('name', 'equalto', item.name) | first).tags | default([]) | join(',')) != item.tags
+  no_log: true
+
+- name: Grant each user full rights on the vhost
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/permissions/{{ rabbitmq_vhost_enc }}/{{ item }}"
+    method: PUT
+    url_username: "{{ rabbitmq_api_user }}"
+    url_password: "{{ rabbitmq_api_password }}"
+    force_basic_auth: true
+    body_format: json
+    body: { configure: ".*", write: ".*", read: ".*" }
+    status_code: [201, 204]
+  loop: "{{ [rabbitmq_admin_user] + rabbitmq_app_users }}"
+  changed_when: false
+  no_log: true
+
+- name: Apply default queue limits policy
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/policies/{{ rabbitmq_vhost_enc }}/{{ rabbitmq_default_policy.name }}"
+    method: PUT
+    url_username: "{{ rabbitmq_api_user }}"
+    url_password: "{{ rabbitmq_api_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      pattern: "{{ rabbitmq_default_policy.pattern }}"
+      apply-to: "{{ rabbitmq_default_policy.apply_to }}"
+      priority: "{{ rabbitmq_default_policy.priority }}"
+      definition: "{{ rabbitmq_default_policy.definition }}"
+    status_code: [201, 204]
+  changed_when: false
+  no_log: true
+
+# One Secret per app with its own credentials and AMQP URI (copy it into the
+# app's namespace, or mount it with an external secrets tool).
+- name: Store app credentials as Secrets
+  ansible.builtin.command:
+    cmd: "{{ rabbitmq_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: rabbitmq-user-{{ item }}
+        namespace: {{ rabbitmq_namespace }}
+        labels:
+          app.kubernetes.io/managed-by: ansible-rabbitmq
+      data:
+        username: {{ item | b64encode }}
+        password: {{ rabbitmq_passwords[item] | b64encode }}
+        uri: {{ ('amqp://' ~ item ~ ':' ~ rabbitmq_passwords[item] ~ '@' ~ rabbitmq_cluster_name ~ '.' ~ rabbitmq_namespace ~ '.svc.cluster.local:5672/') | b64encode }}
+  loop: "{{ rabbitmq_app_users }}"
+  register: rabbitmq_secret_apply
+  changed_when: rabbitmq_secret_apply.stdout is search('(created|configured)')
+  no_log: true

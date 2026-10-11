@@ -1,0 +1,15 @@
+---
+- name: Publish the platform blueprint
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: authentik-blueprints
+        namespace: {{ authentik_namespace }}
+      data:
+        platform.yaml: |
+          {{ lookup('ansible.builtin.template', 'platform-blueprint.yaml.j2') | indent(4) }}
+  register: authentik_blueprint_apply
+  changed_when: authentik_blueprint_apply.stdout is search('(created|configured)')

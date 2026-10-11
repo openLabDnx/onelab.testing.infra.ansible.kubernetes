@@ -7,13 +7,26 @@ authentik_host: "auth.{{ platform_domain }}"
 argocd_host: "argocd.{{ platform_domain }}"
 portainer_host: "portainer.{{ platform_domain }}"
 traefik_dashboard_host: "traefik.{{ platform_domain }}"
+rabbitmq_host: "rabbitmq.{{ platform_domain }}"
+kafka_ui_host: "kafka.{{ platform_domain }}"
+grafana_host: "grafana.{{ platform_domain }}"
 
 authentik_namespace: "authentik"
 argocd_namespace: "argocd"
 portainer_namespace: "portainer"
+rabbitmq_namespace: "rabbitmq"
+kafka_namespace: "kafka"
+observability_namespace: "observability"
 
-# authentik group whose members administer Argo CD, Portainer and the Traefik dashboard
+# authentik group whose members administer Argo CD, Portainer and the admin UIs below
 platform_admin_group: "platform-admins"
+
+# UIs without their own (or with a weak) login, put behind authentik forward-auth
+# (Traefik middleware + authentik proxy provider). Only platform_admin_group gets in.
+platform_forward_auth_apps:
+  - { slug: traefik-dashboard, name: "Traefik dashboard", host: "{{ traefik_dashboard_host }}", launch_path: /dashboard/ }
+  - { slug: rabbitmq, name: "RabbitMQ management", host: "{{ rabbitmq_host }}", launch_path: / }
+  - { slug: kafka-ui, name: "Kafka UI", host: "{{ kafka_ui_host }}", launch_path: / }
 
 # Generated credentials live here on the controller (git-ignored)
 platform_secrets_dir: "{{ inventory_dir }}/../secrets/platform"
@@ -21,8 +34,10 @@ platform_secrets_dir: "{{ inventory_dir }}/../secrets/platform"
 # OIDC clients registered in authentik (secrets generated once, shared with the apps)
 argocd_oidc_client_id: "argocd"
 portainer_oidc_client_id: "portainer"
+grafana_oidc_client_id: "grafana"
 argocd_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/argocd_oidc_client_secret chars=ascii_letters,digits length=48') }}"
 portainer_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/portainer_oidc_client_secret chars=ascii_letters,digits length=48') }}"
+grafana_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/grafana_oidc_client_secret chars=ascii_letters,digits length=48') }}"
 
 # Node sites. master and worker2 share a data centre (~1 ms); worker1 is ~160 ms
 # away. Database-backed apps (authentik + PostgreSQL, Argo CD, Portainer) run

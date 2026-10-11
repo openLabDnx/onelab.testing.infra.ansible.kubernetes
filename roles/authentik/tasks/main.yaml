@@ -62,6 +62,7 @@
         AUTHENTIK_BOOTSTRAP_PASSWORD: {{ authentik_bootstrap_password | b64encode }}
         ARGOCD_OIDC_CLIENT_SECRET: {{ argocd_oidc_client_secret | b64encode }}
         PORTAINER_OIDC_CLIENT_SECRET: {{ portainer_oidc_client_secret | b64encode }}
+        GRAFANA_OIDC_CLIENT_SECRET: {{ grafana_oidc_client_secret | b64encode }}
   register: authentik_secret_apply
   changed_when: authentik_secret_apply.stdout is search('(created|configured)')
   no_log: true
@@ -80,19 +81,7 @@
 
 # --- authentik ---------------------------------------------------------------
 - name: Publish the platform blueprint
-  ansible.builtin.command:
-    cmd: "{{ authentik_kubectl }} apply -f -"
-    stdin: |
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: authentik-blueprints
-        namespace: {{ authentik_namespace }}
-      data:
-        platform.yaml: |
-          {{ lookup('ansible.builtin.template', 'platform-blueprint.yaml.j2') | indent(4) }}
-  register: authentik_blueprint_apply
-  changed_when: authentik_blueprint_apply.stdout is search('(created|configured)')
+  ansible.builtin.import_tasks: blueprint_publish.yaml
 
 - name: Install / upgrade authentik
   kubernetes.core.helm:
@@ -118,19 +107,8 @@
   loop: [authentik-server, authentik-worker]
   changed_when: false
 
-# On a fresh database the worker creates akadmin, the default flows and the
-# self-signed certificate in the background; until then the blueprint's !Find
-# lookups fail, so retry. Applying here (rather than waiting for the worker's
-# own discovery) surfaces blueprint errors in this run.
 - name: Apply the platform blueprint
-  ansible.builtin.command: >
-    {{ authentik_kubectl }} exec deploy/authentik-worker -c worker --
-    ak apply_blueprint /blueprints/mounted/cm-authentik-blueprints/platform.yaml
-  register: authentik_blueprint_run
-  until: authentik_blueprint_run.rc == 0
-  retries: 30
-  delay: 10
-  changed_when: false
+  ansible.builtin.import_tasks: blueprint_apply.yaml
 
 - name: Create Traefik forward-auth middleware
   ansible.builtin.command:
