@@ -1,0 +1,115 @@
+---
+- name: Create Kafka namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ kafka_namespace }}
+  register: kafka_ns_apply
+  changed_when: kafka_ns_apply.stdout is search('(created|configured)')
+
+# Watches its own namespace only. Two replicas with leader election.
+- name: Install / upgrade Strimzi operator
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: strimzi
+    release_namespace: "{{ kafka_namespace }}"
+    chart_repo_url: "{{ strimzi_chart_repo_url }}"
+    chart_ref: strimzi-kafka-operator
+    chart_version: "{{ strimzi_chart_version }}"
+    release_values:
+      replicas: 2
+      nodeSelector: "{{ platform_primary_site_selector }}"
+      resources:
+        requests: { cpu: 100m, memory: 256Mi }
+        limits: { memory: 512Mi }
+    # return right away and poll the rollout below (see roles/authentik)
+    wait: false
+
+- name: Wait for Strimzi operator rollout
+  ansible.builtin.command: "{{ kafka_kubectl }} rollout status deployment/strimzi-cluster-operator --timeout=300s"
+  changed_when: false
+
+# Only the ConfigMap from Strimzi's example file (it also holds a sample cluster).
+- name: Publish Kafka JMX exporter rules
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} apply -f -"
+    stdin: >-
+      {{ (lookup('ansible.builtin.url', kafka_metrics_rules_url, split_lines=False) | from_yaml_all
+          | selectattr('kind', 'defined') | selectattr('kind', 'equalto', 'ConfigMap') | first)
+         | combine({'metadata': {'name': 'kafka-metrics', 'namespace': kafka_namespace}}) | to_json }}
+  register: kafka_metrics_cm_apply
+  changed_when: kafka_metrics_cm_apply.stdout is search('(created|configured)')
+  when: kafka_metrics_enabled
+
+- name: Create Kafka cluster
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'cluster.yaml.j2') }}"
+  register: kafka_cluster_apply
+  changed_when: kafka_cluster_apply.stdout is search('(created|configured)')
+
+- name: Wait for the Kafka cluster to be ready
+  ansible.builtin.command: "{{ kafka_kubectl }} wait kafka/{{ kafka_cluster_name }} --for=condition=Ready --timeout=1200s"
+  changed_when: false
+
+# Server-side diff/apply: Strimzi fills defaults into the ACL lists, so
+# client-side apply would report the users as changed on every run.
+- name: Check app topics and users for drift
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', item) }}"
+  loop: [topics.yaml.j2, users.yaml.j2]
+  register: kafka_objects_diff
+  changed_when: false
+  failed_when: kafka_objects_diff.rc > 1
+
+- name: Declare app topics and users
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', item.item) }}"
+  loop: "{{ kafka_objects_diff.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc == 1
+
+- name: Wait for topics and users to be ready
+  ansible.builtin.command: "{{ kafka_kubectl }} wait {{ item }} -l strimzi.io/cluster={{ kafka_cluster_name }} --for=condition=Ready --timeout=300s"
+  loop: [kafkatopic, kafkauser]
+  changed_when: false
+
+# Server-side diff/apply: client-side apply reports the PDB as changed every run.
+- name: Check Kafka UI for drift
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'kafka-ui.yaml.j2') }}"
+  register: kafka_ui_diff
+  changed_when: false
+  failed_when: kafka_ui_diff.rc > 1
+
+- name: Deploy Kafka UI
+  ansible.builtin.command:
+    cmd: "{{ kafka_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'kafka-ui.yaml.j2') }}"
+  when: kafka_ui_diff.rc == 1
+
+- name: Wait for Kafka UI rollout
+  ansible.builtin.command: "{{ kafka_kubectl }} rollout status deployment/kafka-ui --timeout=300s"
+  changed_when: false
+
+- name: Publish Kafka UI behind authentik
+  ansible.builtin.include_role:
+    name: traefik
+    tasks_from: protected_route.yaml
+  vars:
+    route_name: kafka-ui
+    route_namespace: "{{ kafka_namespace }}"
+    route_host: "{{ kafka_ui_host }}"
+    route_service: kafka-ui
+    route_port: 8080
+
+- name: Verify Kafka
+  ansible.builtin.import_tasks: verify.yaml

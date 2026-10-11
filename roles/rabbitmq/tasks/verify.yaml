@@ -1,0 +1,104 @@
+---
+- name: Read cluster status
+  ansible.builtin.command: >
+    {{ rabbitmq_kubectl }} exec {{ rabbitmq_cluster_name }}-server-0 -c rabbitmq --
+    rabbitmq-diagnostics -q cluster_status --formatter json
+  register: rabbitmq_cluster_status
+  changed_when: false
+
+- name: All nodes are running in one cluster
+  ansible.builtin.assert:
+    that: (rabbitmq_cluster_status.stdout | from_json).running_nodes | length == rabbitmq_replicas
+    fail_msg: "running nodes: {{ (rabbitmq_cluster_status.stdout | from_json).running_nodes }}"
+    quiet: true
+
+# Smoke test as the people admin: a queue declared without a type must become a
+# replicated quorum queue under the default limits, and carry a message.
+- name: Declare test queue
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/queues/{{ rabbitmq_vhost_enc }}/ansible-smoke"
+    method: PUT
+    url_username: "{{ rabbitmq_admin_user }}"
+    url_password: "{{ rabbitmq_passwords[rabbitmq_admin_user] }}"
+    force_basic_auth: true
+    body_format: json
+    body: { durable: true }
+    status_code: [201, 204]
+  changed_when: false
+  no_log: true
+
+- name: Publish and fetch a test message
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/{{ item.path }}"
+    method: POST
+    url_username: "{{ rabbitmq_admin_user }}"
+    url_password: "{{ rabbitmq_passwords[rabbitmq_admin_user] }}"
+    force_basic_auth: true
+    body_format: json
+    body: "{{ item.body }}"
+    return_content: true
+  loop:
+    - path: "exchanges/{{ rabbitmq_vhost_enc }}/amq.default/publish"
+      body: { properties: {}, routing_key: ansible-smoke, payload: hello-from-ansible, payload_encoding: string }
+    - path: "queues/{{ rabbitmq_vhost_enc }}/ansible-smoke/get"
+      body: { count: 1, ackmode: ack_requeue_false, encoding: auto }
+  loop_control:
+    label: "{{ item.path }}"
+  register: rabbitmq_smoke
+  until: item.path is not search('/get') or (rabbitmq_smoke.json | length > 0)
+  retries: 5
+  delay: 2
+  changed_when: false
+  no_log: true
+
+- name: Read test queue
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/queues/{{ rabbitmq_vhost_enc }}/ansible-smoke"
+    url_username: "{{ rabbitmq_admin_user }}"
+    url_password: "{{ rabbitmq_passwords[rabbitmq_admin_user] }}"
+    force_basic_auth: true
+  register: rabbitmq_smoke_queue
+  no_log: true
+
+- name: Delete test queue
+  ansible.builtin.uri:
+    url: "{{ rabbitmq_api }}/queues/{{ rabbitmq_vhost_enc }}/ansible-smoke"
+    method: DELETE
+    url_username: "{{ rabbitmq_admin_user }}"
+    url_password: "{{ rabbitmq_passwords[rabbitmq_admin_user] }}"
+    force_basic_auth: true
+    status_code: [204]
+  changed_when: false
+  no_log: true
+
+- name: Check the smoke test
+  ansible.builtin.assert:
+    that:
+      - rabbitmq_smoke.results[0].json.routed
+      - rabbitmq_smoke.results[1].json[0].payload == 'hello-from-ansible'
+      - rabbitmq_smoke_queue.json.type == 'quorum'
+      - rabbitmq_smoke_queue.json.members | length == rabbitmq_replicas
+      - rabbitmq_smoke_queue.json.effective_policy_definition['max-length-bytes'] is defined
+    quiet: true
+
+# App users have no management access; check their password over the broker itself.
+# The password goes through stdin into the pod (never into the exec request, which
+# the API server may log); rabbitmqctl itself only prompts on a terminal.
+- name: App users can authenticate
+  ansible.builtin.command:
+    cmd: >-
+      {{ rabbitmq_kubectl }} exec -i {{ rabbitmq_cluster_name }}-server-0 -c rabbitmq --
+      sh -c 'read -r P; exec rabbitmqctl -q authenticate_user "$0" "$P"' {{ item }}
+    stdin: "{{ rabbitmq_passwords[item] }}"
+  timeout: 60
+  loop: "{{ rabbitmq_app_users }}"
+  changed_when: false
+  no_log: true
+
+- name: Display RabbitMQ summary
+  ansible.builtin.debug:
+    msg:
+      - "RabbitMQ: {{ (rabbitmq_cluster_status.stdout | from_json).running_nodes | length }} nodes, quorum queues by default (test message OK, {{ rabbitmq_smoke_queue.json.members | length }} replicas)"
+      - "AMQP (in cluster): {{ rabbitmq_cluster_name }}.{{ rabbitmq_namespace }}.svc.cluster.local:5672, vhost '{{ rabbitmq_vhost }}'"
+      - "App users: {{ rabbitmq_app_users | join(', ') }} -> Secrets rabbitmq-user-<name> (uri, username, password)"
+      - "Management UI: https://{{ rabbitmq_host }}/ (authentik, then {{ rabbitmq_admin_user }} / {{ platform_secrets_dir }}/rabbitmq_{{ rabbitmq_admin_user }}_password)"

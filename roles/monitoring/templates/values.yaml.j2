@@ -1,0 +1,97 @@
+# kube-prometheus-stack Helm values (Managed by Ansible)
+# Like the master cluster: no Alertmanager until a receiver (Slack/email) exists;
+# Prometheus still evaluates every alert rule (visible in Grafana > Alerting).
+alertmanager:
+  enabled: false
+
+# RKE2 runs these on 127.0.0.1 only: scraping them would just show them as down
+# and fire false "component down" alerts.
+kubeEtcd: { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeProxy: { enabled: false }
+
+prometheusOperator:
+  nodeSelector:
+    {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
+
+kube-state-metrics:
+  nodeSelector:
+    {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
+
+prometheus:
+  prometheusSpec:
+    # pick up every ServiceMonitor/PodMonitor/PrometheusRule in the cluster
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    retention: {{ prometheus_retention }}
+    retentionSize: {{ prometheus_retention_size }}
+    nodeSelector:
+      {{ platform_primary_site_selector | to_nice_yaml | trim | indent(6) }}
+    resources:
+      {{ prometheus_resources | to_nice_yaml(indent=2) | trim | indent(6) }}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: {{ monitoring_storage_class }}
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: {{ prometheus_storage_size }}
+
+grafana:
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  envValueFrom:
+    GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET:
+      secretKeyRef: { name: grafana-oidc, key: client-secret }
+  "grafana.ini":
+    server:
+      root_url: https://{{ grafana_host }}
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    database:
+      wal: true
+    auth:
+      signout_redirect_url: https://{{ authentik_host }}/application/o/grafana/end-session/
+    # SSO through authentik; platform-admins become Grafana Admin, anyone else Viewer
+    auth.generic_oauth:
+      enabled: true
+      name: authentik
+      client_id: {{ grafana_oidc_client_id }}
+      scopes: openid profile email
+      auth_url: https://{{ authentik_host }}/application/o/authorize/
+      token_url: {{ authentik_internal_url }}/application/o/token/
+      api_url: {{ authentik_internal_url }}/application/o/userinfo/
+      use_pkce: true
+      login_attribute_path: preferred_username
+      name_attribute_path: name
+      email_attribute_path: email
+      role_attribute_path: "contains(groups, '{{ platform_admin_group }}') && 'Admin' || 'Viewer'"
+      allow_sign_up: true
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts: [{{ grafana_host }}]
+  persistence:
+    enabled: true
+    type: pvc
+    storageClassName: {{ monitoring_storage_class }}
+    size: {{ grafana_storage_size }}
+  deploymentStrategy:
+    type: Recreate
+  nodeSelector:
+    {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 768Mi }
+  sidecar:
+    dashboards:
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true

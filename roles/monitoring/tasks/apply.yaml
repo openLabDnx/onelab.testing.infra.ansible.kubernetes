@@ -1,0 +1,17 @@
+---
+# Server-side diff, then apply only on a real difference (idempotent "changed",
+# no size limit from the client-side last-applied annotation).
+# in: ssa_label, ssa_manifest (YAML or JSON text)
+- name: "{{ ssa_label }} | check for drift"
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ ssa_manifest }}"
+  register: ssa_diff
+  changed_when: false
+  failed_when: ssa_diff.rc > 1
+
+- name: "{{ ssa_label }} | apply"
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ ssa_manifest }}"
+  when: ssa_diff.rc == 1

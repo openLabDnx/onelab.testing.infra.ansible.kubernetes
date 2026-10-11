@@ -1,0 +1,111 @@
+---
+# --- operator -----------------------------------------------------------------
+- name: Ensure manifest directory exists
+  ansible.builtin.file:
+    path: "{{ rabbitmq_manifest_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download RabbitMQ Cluster Operator manifest
+  ansible.builtin.get_url:
+    url: "{{ rabbitmq_operator_manifest_url }}"
+    dest: "{{ rabbitmq_manifest_dir }}/rabbitmq-cluster-operator-{{ rabbitmq_operator_version }}.yml"
+    mode: "0644"
+
+# server-side: the CRD is too large for client-side apply's annotation. Diff
+# first, because server-side apply reports every object as applied.
+- name: Check RabbitMQ Cluster Operator for drift
+  ansible.builtin.command: >
+    {{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible
+    -f {{ rabbitmq_manifest_dir }}/rabbitmq-cluster-operator-{{ rabbitmq_operator_version }}.yml
+  register: rabbitmq_operator_diff
+  changed_when: false
+  failed_when: rabbitmq_operator_diff.rc > 1
+
+- name: Install RabbitMQ Cluster Operator
+  ansible.builtin.command: >
+    {{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible
+    -f {{ rabbitmq_manifest_dir }}/rabbitmq-cluster-operator-{{ rabbitmq_operator_version }}.yml
+  when: rabbitmq_operator_diff.rc == 1
+
+- name: Wait for the operator rollout
+  ansible.builtin.command: "{{ cluster_kubectl }} -n rabbitmq-system rollout status deployment/rabbitmq-cluster-operator --timeout=300s"
+  changed_when: false
+
+# --- credentials (generated once on the controller, git-ignored) ------------
+- name: Check local password files
+  ansible.builtin.stat:
+    path: "{{ platform_secrets_dir }}/rabbitmq_{{ item }}_password"
+  loop: "{{ [rabbitmq_admin_user] + rabbitmq_app_users }}"
+  register: rabbitmq_pw_files
+  delegate_to: localhost
+  become: false
+
+- name: List existing app user Secrets
+  ansible.builtin.command: "{{ rabbitmq_kubectl }} get secret -l app.kubernetes.io/managed-by=ansible-rabbitmq -o jsonpath={.items[*].metadata.name}"
+  register: rabbitmq_user_secrets
+  changed_when: false
+  failed_when: false
+
+# A missing file would silently generate a new password and break every client
+# on the next run (production.md MSG-03 / RUN-05). Restore the file instead.
+- name: Refuse to rotate passwords because a local file is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ platform_secrets_dir }}/rabbitmq_{{ item.item }}_password is missing but Secret
+      rabbitmq-user-{{ item.item }} exists. Restore the file (e.g. from the Secret) before re-running.
+  loop: "{{ rabbitmq_pw_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - not item.stat.exists
+    - ('rabbitmq-user-' ~ item.item) in rabbitmq_user_secrets.stdout.split()
+
+- name: Generate and persist RabbitMQ passwords
+  ansible.builtin.set_fact:
+    rabbitmq_passwords: >-
+      {{ rabbitmq_passwords | default({}) | combine({item: lookup('ansible.builtin.password',
+         platform_secrets_dir ~ '/rabbitmq_' ~ item ~ '_password chars=ascii_letters,digits length=32')}) }}
+  loop: "{{ [rabbitmq_admin_user] + rabbitmq_app_users }}"
+  no_log: true
+
+# --- cluster ------------------------------------------------------------------
+- name: Create RabbitMQ namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ rabbitmq_namespace }}
+  register: rabbitmq_ns_apply
+  changed_when: rabbitmq_ns_apply.stdout is search('(created|configured)')
+
+- name: Create RabbitMQ cluster
+  ansible.builtin.command:
+    cmd: "{{ rabbitmq_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'cluster.yaml.j2') }}"
+  register: rabbitmq_cluster_apply
+  changed_when: rabbitmq_cluster_apply.stdout is search('(created|configured)')
+
+- name: Wait for all RabbitMQ nodes
+  ansible.builtin.command: "{{ rabbitmq_kubectl }} wait rabbitmqcluster/{{ rabbitmq_cluster_name }} --for=condition=AllReplicasReady --timeout=900s"
+  changed_when: false
+
+# --- users, permissions, policy (management API, reconciled to Ansible's values)
+- name: Users, permissions and policy
+  ansible.builtin.import_tasks: users.yaml
+
+- name: Publish the management UI behind authentik
+  ansible.builtin.include_role:
+    name: traefik
+    tasks_from: protected_route.yaml
+  vars:
+    route_name: rabbitmq-management
+    route_namespace: "{{ rabbitmq_namespace }}"
+    route_host: "{{ rabbitmq_host }}"
+    route_service: "{{ rabbitmq_cluster_name }}"
+    route_port: 15672
+
+- name: Verify RabbitMQ
+  ansible.builtin.import_tasks: verify.yaml

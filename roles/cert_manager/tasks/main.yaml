@@ -1,0 +1,51 @@
+---
+- name: Install / upgrade cert-manager
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: cert-manager
+    release_namespace: "{{ cert_manager_namespace }}"
+    create_namespace: true
+    chart_repo_url: "{{ cert_manager_chart_repo_url }}"
+    chart_ref: cert-manager
+    chart_version: "{{ cert_manager_chart_version }}"
+    release_values:
+      crds:
+        enabled: true
+        keep: true                 # never delete Certificates with the release
+      replicaCount: 2
+      podDisruptionBudget: { enabled: true, minAvailable: 1 }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app.kubernetes.io/name: cert-manager, app.kubernetes.io/instance: cert-manager } }
+          matchLabelKeys: [pod-template-hash]
+      resources: { requests: { cpu: 10m, memory: 64Mi }, limits: { memory: 256Mi } }
+      webhook:
+        replicaCount: 2
+        podDisruptionBudget: { enabled: true, minAvailable: 1 }
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector: { matchLabels: { app.kubernetes.io/name: webhook, app.kubernetes.io/instance: cert-manager } }
+            matchLabelKeys: [pod-template-hash]
+        resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+      cainjector:
+        replicaCount: 2
+        podDisruptionBudget: { enabled: true, minAvailable: 1 }
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector: { matchLabels: { app.kubernetes.io/name: cainjector, app.kubernetes.io/instance: cert-manager } }
+            matchLabelKeys: [pod-template-hash]
+        resources: { requests: { cpu: 10m, memory: 64Mi }, limits: { memory: 256Mi } }
+    # return right away and poll the rollouts below (see roles/authentik)
+    wait: false
+
+- name: Wait for cert-manager rollout
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ cert_manager_namespace }} rollout status deployment/{{ item }} --timeout=300s"
+  loop: [cert-manager, cert-manager-webhook, cert-manager-cainjector]
+  changed_when: false

@@ -1,0 +1,38 @@
+---
+# Defaults for rabbitmq role
+# RabbitMQ Cluster Operator + a 3-node cluster (one node per server) with quorum
+# queues by default (production.md MSG-03/05/06).
+rabbitmq_operator_version: "v2.23.0"
+rabbitmq_operator_manifest_url: "https://github.com/rabbitmq/cluster-operator/releases/download/{{ rabbitmq_operator_version }}/cluster-operator.yml"
+rabbitmq_cluster_name: "rabbitmq"
+rabbitmq_replicas: 3
+rabbitmq_image: "rabbitmq:4.3.5-management"        # same version as the master cluster
+rabbitmq_storage_class: "local-path-retain"
+rabbitmq_storage_size: "10Gi"
+rabbitmq_cpu_request: "250m"
+rabbitmq_memory: "1Gi"                             # request = limit; the operator sizes the memory alarm from it
+rabbitmq_disk_free_limit: "2GB"                    # publishers are blocked before the disk fills
+
+rabbitmq_vhost: "/"                                # the apps' URIs use the default vhost
+# People log in to the management UI as admin. Apps never use it: each gets its own
+# user with no management access, full rights on the vhost only.
+rabbitmq_admin_user: "admin"
+rabbitmq_app_users:
+  - booking
+  - garages-cms
+  - billing
+  - subscription
+
+# Default limits for every queue (lowest priority: an app policy with a higher
+# priority wins). Agree the numbers with the app owners.
+rabbitmq_default_policy:
+  name: autofik-default-limits
+  pattern: ".*"
+  apply_to: queues
+  priority: 0
+  definition:
+    max-length-bytes: 1073741824                   # 1 GiB per queue
+    overflow: reject-publish
+
+rabbitmq_manifest_dir: "/opt/autofik/manifests"
+rabbitmq_kubectl: "{{ cluster_kubectl }} -n {{ rabbitmq_namespace }}"

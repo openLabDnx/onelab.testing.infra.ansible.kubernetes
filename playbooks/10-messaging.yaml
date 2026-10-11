@@ -1,0 +1,49 @@
+---
+# Messaging: RabbitMQ (3-node cluster, quorum queues) and Kafka (Strimzi, 3 KRaft
+# nodes), with their admin UIs behind authentik. Needs 09-platform first
+# (authentik, Traefik). Run one part with --tags rabbitmq / kafka.
+- name: Label nodes by site
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [always]
+  tasks:
+    - name: Label nodes
+      ansible.builtin.include_role:
+        name: platform_vars
+        tasks_from: label_nodes.yaml
+
+- name: cert-manager (RabbitMQ operator webhooks)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [cert_manager, rabbitmq]
+  roles:
+    - cert_manager
+
+- name: authentik SSO apps for the messaging UIs
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [rabbitmq, kafka]
+  tasks:
+    - name: Publish and apply the platform blueprint
+      ansible.builtin.include_role:
+        name: authentik
+        tasks_from: blueprint.yaml
+
+- name: RabbitMQ
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [rabbitmq]
+  roles:
+    - rabbitmq
+
+- name: Kafka
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [kafka]
+  roles:
+    - kafka

@@ -1,0 +1,86 @@
+---
+- name: Get Prometheus and Grafana service addresses
+  ansible.builtin.command: "{{ monitoring_kubectl }} get svc {{ item }} -o jsonpath={.spec.clusterIP}"
+  loop: [kube-prometheus-stack-prometheus, kube-prometheus-stack-grafana]
+  register: monitoring_svc
+  changed_when: false
+
+- name: Set monitoring endpoints
+  ansible.builtin.set_fact:
+    prometheus_api: "http://{{ monitoring_svc.results[0].stdout }}:9090/api/v1"
+    grafana_api: "http://{{ monitoring_svc.results[1].stdout }}:80/api"
+
+# New PodMonitors/ServiceMonitors take a reload plus a scrape interval to show up.
+- name: Wait until every Kafka and RabbitMQ target is scraped and up
+  ansible.builtin.uri:
+    url: "{{ prometheus_api }}/query?query={{ query | urlencode }}"
+    return_content: true
+  vars:
+    query: 'count by (namespace) (up{namespace=~"{{ kafka_namespace }}|{{ rabbitmq_namespace }}"})'
+  register: monitoring_targets
+  until: >-
+    monitoring_targets.json.data.result | selectattr('metric.namespace', 'equalto', kafka_namespace) | list | length > 0
+    and monitoring_targets.json.data.result | selectattr('metric.namespace', 'equalto', rabbitmq_namespace) | list | length > 0
+  retries: 30
+  delay: 10
+
+- name: Read key metrics
+  ansible.builtin.uri:
+    url: "{{ prometheus_api }}/query?query={{ item.query | urlencode }}"
+    return_content: true
+  loop:
+    - { name: targets_down, query: 'count(up{namespace=~"kafka|rabbitmq"} == 0) or vector(0)' }
+    - { name: targets_up, query: 'count(up{namespace=~"kafka|rabbitmq"} == 1)' }
+    - { name: kafka_brokers, query: 'max(kafka_brokers)' }
+    - { name: under_replicated, query: 'sum(kafka_server_replicamanager_underreplicatedpartitions)' }
+    - { name: offline_partitions, query: 'sum(kafka_controller_kafkacontroller_offlinepartitionscount)' }
+    - { name: rabbitmq_nodes, query: 'count(rabbitmq_identity_info)' }
+    - { name: nodes_scraped, query: 'count(node_uname_info)' }
+  loop_control:
+    label: "{{ item.name }}"
+  register: monitoring_metrics
+  until: monitoring_metrics.json.data.result | length > 0
+  retries: 12
+  delay: 10
+
+- name: Collect metric values
+  ansible.builtin.set_fact:
+    monitoring_values: "{{ monitoring_values | default({}) | combine({item.item.name: (item.json.data.result[0].value[1] | float | int)}) }}"
+  loop: "{{ monitoring_metrics.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: List Grafana dashboards
+  ansible.builtin.uri:
+    url: "{{ grafana_api }}/search?type=dash-db&limit=500"
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  register: monitoring_dashboards_list
+  until: >-
+    monitoring_dashboards_list.status == 200 and
+    (monitoring_dashboards_list.json | selectattr('title', 'search', '^(Strimzi|RabbitMQ)') | list | length) >= monitoring_dashboards | length
+  retries: 18
+  delay: 10
+  no_log: true
+
+- name: Check monitoring
+  ansible.builtin.assert:
+    that:
+      - monitoring_values.targets_down == 0
+      - monitoring_values.kafka_brokers == monitoring_expected_kafka_brokers
+      - monitoring_values.under_replicated == 0
+      - monitoring_values.offline_partitions == 0
+      - monitoring_values.rabbitmq_nodes == monitoring_expected_rabbitmq_nodes
+    fail_msg: "monitoring check failed: {{ monitoring_values | to_json }}"
+    quiet: true
+
+- name: Display monitoring summary
+  ansible.builtin.debug:
+    msg:
+      - "Prometheus: {{ monitoring_values.targets_up }} Kafka/RabbitMQ targets up, {{ monitoring_values.targets_down }} down; {{ monitoring_values.nodes_scraped }} nodes"
+      - "Kafka: {{ monitoring_values.kafka_brokers }} brokers, {{ monitoring_values.under_replicated }} under-replicated, {{ monitoring_values.offline_partitions }} offline partitions"
+      - "RabbitMQ: {{ monitoring_values.rabbitmq_nodes }} nodes"
+      - "Dashboards: {{ monitoring_dashboards_list.json | selectattr('title', 'search', '^(Strimzi|RabbitMQ)') | map(attribute='title') | sort | join(', ') }}"
+      - "Grafana: https://{{ grafana_host }}/ (Sign in with authentik; break-glass admin / {{ platform_secrets_dir }}/grafana_admin_password)"

@@ -1,0 +1,42 @@
+---
+# Free Kafka/RabbitMQ monitoring instead of Confluent Control Center (license):
+# Prometheus + Grafana (SSO through authentik) with Strimzi and RabbitMQ
+# dashboards. Needs 09-platform and 10-messaging first.
+# Run one part with --tags authentik / kafka / monitoring.
+- name: Label nodes by site
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [always]
+  tasks:
+    - name: Label nodes
+      ansible.builtin.include_role:
+        name: platform_vars
+        tasks_from: label_nodes.yaml
+
+# Adds the Grafana OIDC client (config Secret + blueprint); restarts authentik
+# once when its configuration changes.
+- name: authentik SSO app for Grafana
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [authentik]
+  roles:
+    - authentik
+
+# Turns on the brokers' JMX metrics and Kafka Exporter (rolling broker restart).
+- name: Kafka metrics
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [kafka]
+  roles:
+    - kafka
+
+- name: Prometheus + Grafana
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [monitoring]
+  roles:
+    - monitoring
