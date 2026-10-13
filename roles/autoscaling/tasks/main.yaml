@@ -1,0 +1,76 @@
+---
+# HPAs read pod CPU from the metrics API, served by RKE2's bundled metrics-server.
+- name: Check that the metrics API answers
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} get apiservice v1beta1.metrics.k8s.io
+    -o 'jsonpath={.status.conditions[?(@.type=="Available")].status}'
+  register: autoscaling_metrics_api
+  until: autoscaling_metrics_api.stdout == 'True'
+  retries: 6
+  delay: 10
+  changed_when: false
+
+- name: Find the apps to autoscale
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ item.namespace }} get deployment {{ item.name }} --ignore-not-found
+    -o jsonpath={.spec.template.spec.containers[*].name}
+  loop: "{{ autoscaling_targets }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  register: autoscaling_found
+  changed_when: false
+
+- name: Split deployed and missing apps
+  ansible.builtin.set_fact:
+    autoscaling_present: "{{ autoscaling_found.results | selectattr('stdout') | map(attribute='item') | list }}"
+    autoscaling_missing: "{{ autoscaling_found.results | rejectattr('stdout') | map(attribute='item') | list }}"
+
+- name: Note apps that are not deployed (skipped)
+  ansible.builtin.debug:
+    msg: "Not deployed yet, no autoscaling: {{ autoscaling_missing | map(attribute='name') | join(', ') }}"
+  when: autoscaling_missing | length > 0
+
+- name: The scaled container exists in each app
+  ansible.builtin.assert:
+    that: item.item.container in item.stdout.split()
+    fail_msg: "{{ item.item.namespace }}/{{ item.item.name }} has containers {{ item.stdout.split() }}, not '{{ item.item.container }}'"
+    quiet: true
+  loop: "{{ autoscaling_found.results | selectattr('stdout') | list }}"
+  loop_control:
+    label: "{{ item.item.namespace }}/{{ item.item.name }}"
+
+# Server-side diff/apply (see roles/monitoring tasks/apply.yaml).
+- name: Check the autoscalers for drift
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'hpa.yaml.j2') }}"
+  register: autoscaling_diff
+  changed_when: false
+  failed_when: autoscaling_diff.rc > 1
+  when: autoscaling_present | length > 0
+
+- name: Apply the autoscalers
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'hpa.yaml.j2') }}"
+  when:
+    - autoscaling_present | length > 0
+    - autoscaling_diff.rc == 1
+
+# An app taken off autoscaling_targets keeps the replica count its HPA left it at.
+- name: List the autoscalers made by this role
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} get hpa -A -l {{ autoscaling_label }}=true
+    -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'
+  register: autoscaling_existing
+  changed_when: false
+
+- name: Remove autoscalers that are no longer listed
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ item.split('/')[0] }} delete hpa {{ item.split('/')[1] }}"
+  loop: >-
+    {{ autoscaling_existing.stdout_lines | select
+       | difference(autoscaling_present | map(attribute='namespace') | zip(autoscaling_present | map(attribute='name')) | map('join', '/') | list) }}
+  changed_when: true
+
+- name: Verify autoscaling
+  ansible.builtin.import_tasks: verify.yaml
