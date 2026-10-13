@@ -1,9 +1,4 @@
 ---
-- name: Generate and persist the Grafana break-glass password
-  ansible.builtin.set_fact:
-    grafana_admin_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/grafana_admin_password chars=ascii_letters,digits length=32') }}"
-  no_log: true
-
 # The namespace must exist before a server-side diff of objects inside it.
 - name: Create observability namespace
   ansible.builtin.command:
@@ -16,6 +11,7 @@
   register: monitoring_ns_apply
   changed_when: monitoring_ns_apply.stdout is search('(created|configured)')
 
+# The break-glass password is generated once into platform_secrets_dir (platform_vars).
 - name: Create Grafana Secrets
   ansible.builtin.include_tasks: apply.yaml
   vars:
@@ -62,6 +58,11 @@
     - kube-prometheus-stack-kube-state-metrics
   changed_when: false
 
+# node-exporter (behind kube-rbac-proxy) on every node
+- name: Wait for node-exporter
+  ansible.builtin.command: "{{ monitoring_kubectl }} rollout status daemonset/kube-prometheus-stack-prometheus-node-exporter --timeout=600s"
+  changed_when: false
+
 - name: Wait for Prometheus
   ansible.builtin.command: "{{ monitoring_kubectl }} rollout status statefulset/prometheus-kube-prometheus-stack-prometheus --timeout=600s"
   register: monitoring_prom_rollout
@@ -87,16 +88,20 @@
   loop: "{{ strimzi_rules }}"
 
 # Grafana's sidecar loads every ConfigMap labelled grafana_dashboard=1; the
-# dashboards' ${DS_PROMETHEUS} input points at the stack's Prometheus datasource.
+# dashboards' ${DS_PROMETHEUS} input points at the stack's Prometheus datasource
+# (the others pick the default datasource or name uid prometheus / loki).
 - name: Grafana dashboards
   ansible.builtin.include_tasks: apply.yaml
   vars:
+    dashboard_json: >-
+      {{ lookup('ansible.builtin.url', item.url, split_lines=False) if item.url is defined
+         else lookup('ansible.builtin.file', item.file) }}
     ssa_label: "dashboard {{ item.name }}"
     ssa_manifest: >-
       {{ {'apiVersion': 'v1', 'kind': 'ConfigMap',
           'metadata': {'name': 'dashboard-' ~ item.name, 'namespace': observability_namespace,
                        'labels': {'grafana_dashboard': '1'}, 'annotations': {'grafana_folder': item.folder}},
-          'data': {item.name ~ '.json': lookup('ansible.builtin.url', item.url, split_lines=False) | replace('${DS_PROMETHEUS}', 'prometheus')}}
+          'data': {item.name ~ '.json': dashboard_json | replace('${DS_PROMETHEUS}', 'prometheus')}}
          | to_json }}
   loop: "{{ monitoring_dashboards }}"
   loop_control:

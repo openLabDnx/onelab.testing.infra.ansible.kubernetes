@@ -60,7 +60,10 @@ autofik.infra.testing/
 │   ├── cert_manager/            # cert-manager (needed by the RabbitMQ operator)
 │   ├── rabbitmq/                # RabbitMQ Cluster Operator, 3-node cluster, users, policy, UI route
 │   ├── kafka/                   # Strimzi, Kafka KRaft x3, topics, users/ACLs, kafbat UI, metrics
-│   └── monitoring/              # kube-prometheus-stack, Grafana SSO, Kafka/RabbitMQ monitors, rules, dashboards
+│   ├── monitoring/              # kube-prometheus-stack, Grafana SSO + datasources, node-exporter behind kube-rbac-proxy, dashboards
+│   ├── loki/                    # Loki (logs, 30 days), NetworkPolicy, alerts
+│   ├── jaeger/                  # Jaeger v2 (traces, 7 days, span metrics), UI behind authentik, NetworkPolicy, alerts
+│   └── alloy/                   # Grafana Alloy on every node: logs + events -> Loki, OTLP -> Jaeger/Loki/Prometheus
 │       ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
 │       ├── tasks/
 │       └── templates/cloudflared.yaml.j2
@@ -82,7 +85,7 @@ autofik.infra.testing/
 │   ├── apisix-reset.yaml        # Destroy APISIX and its etcd data (asks to confirm)
 │   ├── 09-platform.yaml         # Traefik, CloudNativePG, authentik, Argo CD, Portainer (tags per part)
 │   ├── 10-messaging.yaml        # cert-manager, RabbitMQ, Kafka (tags per part)
-│   ├── 11-monitoring.yaml       # Prometheus + Grafana for Kafka/RabbitMQ (replaces Control Center)
+│   ├── 11-monitoring.yaml       # Metrics, logs, traces: Prometheus, Grafana, Loki, Jaeger, Alloy (tags per part)
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
@@ -374,7 +377,8 @@ Every UI is published under `*.testing.autofik.com`. The Cloudflare tunnel alrea
 | https://traefik.testing.autofik.com/dashboard/ | Traefik dashboard | authentik forward-auth (no login of its own) |
 | https://rabbitmq.testing.autofik.com | RabbitMQ management | authentik forward-auth, then RabbitMQ `admin` |
 | https://kafka.testing.autofik.com | Kafka UI (kafbat, read-only) | authentik forward-auth |
-| https://grafana.testing.autofik.com | Grafana (Kafka/RabbitMQ/cluster dashboards) | **Sign in with authentik** |
+| https://grafana.testing.autofik.com | Grafana (metrics, logs, traces, dashboards) | **authentik, automatically** (also from the Grafana tile in authentik); break-glass `admin` / `secrets/platform/grafana_admin_password` at `/login?disableAutoLogin` |
+| https://jaeger.testing.autofik.com | Jaeger (traces) | authentik forward-auth (no login of its own) |
 
 Only members of the authentik group **`platform-admins`** can open these apps (`akadmin` is in it); anyone else gets authentik's "Permission denied". Argo CD maps that group to `role:admin`. In Portainer, SSO users land in team `sso-users` **with no environment access**; usernames listed in `portainer_admin_users` (`roles/portainer/defaults/main.yaml`, default `akadmin`) are made Portainer administrators after their first SSO login and a re-run of `make portainer`.
 
@@ -439,27 +443,76 @@ make kafka       # Kafka only
 
 ---
 
-## 📈 Monitoring: Prometheus + Grafana (instead of Confluent Control Center)
+## 📈 Observability: metrics, logs, traces (Grafana, Prometheus, Loki, Jaeger)
 
-**Why not Confluent Control Center:** it's an enterprise-licensed component. On a 3-broker cluster it only runs as a 30-day trial, and then it no longer starts. Its metric dashboards also need Confluent Server brokers; this cluster runs Apache Kafka (Strimzi). See `production.md` MSG-01, option B, in the master repo.
+Everything is free software, viewed in one Grafana, and runs in namespace `observability`. Kafka is monitored this way instead of Confluent Control Center: that is an enterprise-licensed component, which on a 3-broker cluster only runs as a 30-day trial, and its dashboards need Confluent Server brokers; this cluster runs Apache Kafka (Strimzi). See `production.md` MSG-01, option B, in the master repo.
 
-The free stack gives the same visibility:
+```text
+ app pods ──OTLP──▶ Alloy (one per node) ──traces──▶ Jaeger ──span metrics──┐
+ pod logs, journal,        │                 └─UI: jaeger.testing (authentik)  │
+ kubelet log ─────────────▶├──logs──────────▶ Loki                             ▼
+ Kubernetes events ───────▶┘  (once, clustered)                           Prometheus ◀── node-exporter, kube-state-metrics,
+                                                                                         kubelet, Kafka, RabbitMQ, Loki, Alloy
+ Grafana (grafana.testing, authentik) ◀── Prometheus + Loki + Jaeger, linked: trace ⇄ its logs, graph ⇄ example trace
+```
 
 | What | Where |
 | :--- | :--- |
-| Grafana (dashboards, alerts) | https://grafana.testing.autofik.com: **Sign in with authentik** (`platform-admins` = Admin, others Viewer). Break-glass: `admin` / `secrets/platform/grafana_admin_password` |
-| Kafka dashboards (folder *Kafka*) | Strimzi Kafka (brokers, throughput, partitions), Strimzi KRaft (controller quorum), Strimzi Kafka Exporter (**consumer lag**, offsets), Strimzi Operators |
-| RabbitMQ dashboards (folder *RabbitMQ*) | RabbitMQ-Overview, RabbitMQ-Quorum-Queues-Raft |
+| Grafana | https://grafana.testing.autofik.com, or the **Grafana** tile in authentik: signs you in through authentik automatically (`platform-admins` = Admin, others Viewer). Break-glass: https://grafana.testing.autofik.com/login?disableAutoLogin as `admin` / `secrets/platform/grafana_admin_password` |
+| Metrics | Prometheus, 15 days / 18 GB: every node (node-exporter), every pod and container (kubelet, cAdvisor, kube-state-metrics), Kafka, RabbitMQ, and the observability stack itself |
+| Logs | **Loki, 30 days**: every pod's stdout/stderr, each node's journal (rke2, sshd, kernel...), the RKE2 kubelet log, Kubernetes events. Grafana → **Drilldown → Logs**, **Explore → Loki**, or dashboard *Logs / Kubernetes / Pod Logs* |
+| Traces | **Jaeger, 7 days**: https://jaeger.testing.autofik.com (authentik, `platform-admins`; tile in authentik), or Grafana → **Explore → Jaeger**. The **Monitor** tab shows request rate, errors and latency per service and operation |
+| Dashboards | *Kubernetes* (cluster, namespaces, nodes, pods, workloads: the chart's set plus the dotdc views), *Nodes* (Node Exporter Full), *Logs*, *Kafka* (Strimzi, incl. **consumer lag**), *RabbitMQ* |
+| Alerts | Kubernetes and node defaults (incl. disks filling up), Strimzi's Kafka rules, and Loki / Alloy / Jaeger health, in Grafana → Alerting |
 | Topics, consumer groups, messages | Kafka UI (kafbat): https://kafka.testing.autofik.com |
-| Alerts | Strimzi's rules (disk running out, under-replicated or offline partitions, consumer lag...) plus the Kubernetes defaults, in Grafana → Alerting |
 
 ```bash
-make monitoring   # authentik SSO app, Kafka metrics, Prometheus + Grafana, dashboards (safe to re-run)
+make monitoring   # all of it, in order, ending with an end-to-end check (safe to re-run)
+make loki         # Loki only
+make jaeger       # Jaeger + its authentik app and route
+make alloy        # Alloy, then the end-to-end check: a test trace and log line through Alloy,
+                  # read back from Jaeger and Loki via Grafana; logs from every node; events
 ```
 
-- **Prometheus:** 15 days or 18 GB of metrics on a 20 Gi `local-path-retain` volume, on the European nodes.
-- **No Alertmanager yet** (same as the master cluster): rules are evaluated and shown in Grafana, but nothing is sent. Add a receiver (Slack, email) and set `alertmanager.enabled: true` in `roles/monitoring/templates/values.yaml.j2`.
+The playbook's last step proves the whole path: a test trace and log line go into Alloy like an app would send them, and must come back out of Jaeger and Loki through Grafana's datasources. It also checks that every node ships pod logs and journal, and that Kubernetes events arrive. Steps that go through the internet (Cloudflare) are tagged `public`; `--skip-tags public` leaves them out.
+
+### Sending traces (and metrics) from the apps
+Point the OpenTelemetry SDK or agent at Alloy. Each pod reaches the Alloy on its own node:
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy.observability.svc:4318   # or :4317 with OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_SERVICE_NAME=booking                                         # the name you'll search for in Jaeger
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=1.0      # keep all traces; lower it (e.g. 0.2) for busy services
+OTEL_LOGS_EXPORTER=none          # stdout is collected already; OTLP logs would arrive twice
+OTEL_METRICS_EXPORTER=otlp       # lands in Prometheus (or keep exposing /metrics + a ServiceMonitor)
+```
+- **Java (Spring):** start with `-javaagent:/otel/opentelemetry-javaagent.jar`; the agent instruments HTTP, JDBC, Kafka and RabbitMQ clients by itself.
+- **Go:** use the OTel SDK with the `otlptracehttp` exporter (it reads the same variables).
+- **Logs ↔ traces:** write the trace id in your log lines (for example a JSON field `trace_id`, or Logback's `%X{trace_id}` with the Java agent). Alloy turns it into Loki metadata. In Grafana, a log line then gets an **Open trace in Jaeger** button, and a span's **Logs for this span** shows its log lines.
+- Alloy adds `k8s.namespace.name`, `k8s.pod.name`, `k8s.deployment.name` and similar attributes to every span, based on the sender's pod IP.
+- Don't send to Jaeger directly: a NetworkPolicy only lets Alloy in.
+
+### How it is built for this cluster
+| | Runs on | Requests / limit | Storage |
+| :--- | :--- | :--- | :--- |
+| Loki 3.7.8 (chart 18.13.7, monolithic) | 1 pod, `eu` site, preferably not the 12 GB master | 250m, 1 GiB / 2 GiB | 50 Gi `local-path-retain`, 30 days retention by the compactor |
+| Jaeger 2.20.0 (Badger storage; 2.21+ drops the API Grafana uses) | 1 pod, `eu` site, preferably not the master | 100m, 256 MiB / 1 GiB | 20 Gi `local-path-retain`, spans kept 7 days |
+| Alloy v1.20.0 (chart 1.13.0) | every node (DaemonSet) | 50m, 128 MiB / 512 MiB | read positions in `/var/lib/alloy` on the node |
+| Prometheus, Grafana | `eu` site | unchanged | unchanged |
+
+- **One Loki and one Jaeger:** with only node-local disks (no S3/object storage), each can run only one copy. If its node goes down, logs and traces stop being stored until it is back. Alloy keeps retrying for about an hour, and file and journal logs are read on from where Alloy stopped, so they arrive late but aren't lost. Spans are queued for 10 minutes only. Real HA needs object storage (S3/MinIO) for Loki and an OpenSearch/ClickHouse backend for Jaeger.
+- **Disk:** `local-path` doesn't enforce volume sizes, and the node disks are shared. Volume is limited by retention and Loki's ingestion limits (`roles/loki/defaults/main.yaml`). The node-exporter alerts *NodeFilesystemSpaceFillingUp* / *AlmostOutOfSpace* warn before a disk fills. Today's raw logs are about 0.5 GB/day, which takes a few GB compressed over 30 days.
+- **worker1 is 160 ms away:** its Alloy batches and compresses before sending, and apps there talk to the Alloy on their own node.
+- **Security:**
+  - node-exporter needs the host network, and the node IPs are public. It now listens on `127.0.0.1` only, behind kube-rbac-proxy on `:9100` (TLS + Prometheus' token), so anonymous requests get `401`.
+  - Loki and Jaeger have no login: NetworkPolicies let in only Alloy, Grafana, Prometheus and Traefik.
+  - The Jaeger UI is behind authentik.
+  - Alloy runs as root (the log files are root-only) but with every capability dropped and a read-only root filesystem.
+  - RKE2's `containerd.log` isn't collected: it sits inside containerd's root directory, and mounting that would let Alloy read every container's files. Image-pull errors still show up as Kubernetes events.
+- **Not changed here:** RKE2 itself still answers on the public IPs with Calico's metrics (`:9091`) and flannel's health (`:8081`); kube-rbac-proxy's health check is on `:8888` (TLS, `/healthz` only). A host firewall allowing those ports only between the nodes would close them.
+- **No Alertmanager yet** (same as the master cluster): rules are evaluated and shown in Grafana, but nothing is sent. Add a receiver (Slack, email) and set `alertmanager.enabled: true` in `roles/monitoring/templates/values.yaml.j2`. `PrometheusNotConnectedToAlertmanagers` is switched off until then.
 - **Control-plane scraping is off:** RKE2 binds etcd, the scheduler, the controller-manager and kube-proxy to localhost, so those targets are disabled instead of showing as permanently down.
+- **Upgrades:** bump the version in the role's `defaults/main.yaml` and re-run its `make` target. Jaeger's volume size can't be changed in place (StatefulSet): delete the StatefulSet with `--cascade=orphan`, then re-run `make jaeger`.
 
 ---
 

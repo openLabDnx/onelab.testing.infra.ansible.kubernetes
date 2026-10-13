@@ -1,0 +1,270 @@
+// Grafana Alloy, one per node (Managed by Ansible)
+//  - logs of this node's pods, its journal and the RKE2 kubelet log -> Loki
+//  - Kubernetes events, once for the whole cluster (clustering) -> Loki
+//  - OTLP from the apps: traces -> Jaeger, logs -> Loki, metrics -> Prometheus
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ---------------------------------------------------------------- pod logs
+// Only this node's pods: the files are on this node.
+discovery.kubernetes "pods" {
+  role = "pod"
+  selectors {
+    role  = "pod"
+    field = "spec.nodeName=" + sys.env("HOSTNAME")
+  }
+}
+
+discovery.relabel "pod_logs" {
+  targets = discovery.kubernetes.pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_node_name"]
+    target_label  = "node"
+  }
+  // app = first of app.kubernetes.io/name, app, k8s-app; Loki derives service_name from it
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name", "__meta_kubernetes_pod_label_app", "__meta_kubernetes_pod_label_k8s_app"]
+    separator     = ";"
+    regex         = "^;*([^;]+).*$"
+    target_label  = "app"
+  }
+  rule {
+    source_labels = ["namespace", "container"]
+    separator     = "/"
+    target_label  = "job"
+  }
+  // /var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log
+  rule {
+    source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+    separator     = "/"
+    replacement   = "/var/log/pods/*$1/*.log"
+    target_label  = "__path__"
+  }
+  // static pods (kube-apiserver, etcd, ...) use their config hash instead of the uid
+  rule {
+    source_labels = ["__meta_kubernetes_pod_annotation_kubernetes_io_config_hash", "__meta_kubernetes_pod_container_name"]
+    separator     = "/"
+    regex         = "(.+)/(.+)"
+    replacement   = "/var/log/pods/*$1/$2/*.log"
+    target_label  = "__path__"
+  }
+}
+
+local.file_match "pod_logs" {
+  path_targets = discovery.relabel.pod_logs.output
+}
+
+loki.source.file "pod_logs" {
+  targets    = local.file_match.pod_logs.targets
+  forward_to = [loki.process.pod_logs.receiver]
+}
+
+loki.process "pod_logs" {
+  // "<time> <stdout|stderr> <F|P> <line>"; partial lines are joined
+  stage.cri {}
+
+  // A trace id in the line (JSON or key=value) becomes trace_id metadata:
+  // Grafana shows "Open trace in Jaeger", and Jaeger finds the trace's logs.
+  stage.regex {
+    expression = "(?i)trace[_-]?id\"?\\s*[:=]\\s*\"?(?P<trace_id>[0-9a-f]{32})"
+  }
+
+  // pod as metadata, not a label: a label would start a new stream per pod
+  // (and so would the file name that loki.source.file adds)
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+      pod      = "",
+    }
+  }
+  stage.label_drop {
+    values = ["pod", "filename"]
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+// ---------------------------------------------------------------- node logs
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+// systemd journal: rke2-server / rke2-agent, sshd, kernel, ...
+loki.source.journal "node" {
+  path          = "/var/log/journal"
+  max_age       = "12h"
+  relabel_rules = loki.relabel.journal.rules
+  labels        = {
+    job  = "node/journal",
+    node = sys.env("HOSTNAME"),
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+// RKE2 writes the kubelet's log to a file, not to the journal
+local.file_match "kubelet" {
+  path_targets = [{
+    "__path__" = "/var/lib/rancher/rke2/agent/logs/kubelet.log",
+    "job"      = "node/kubelet",
+    "node"     = sys.env("HOSTNAME"),
+  }]
+}
+
+loki.source.file "kubelet" {
+  targets    = local.file_match.kubelet.targets
+  forward_to = [loki.write.default.receiver]
+}
+
+// ---------------------------------------------------------------- events
+// Kept by Kubernetes for one hour only. Clustering splits the namespaces
+// between the Alloy pods, so every event is shipped once.
+loki.source.kubernetes_events "cluster" {
+  job_name   = "integrations/kubernetes/eventhandler"
+  log_format = "logfmt"
+  clustering {
+    enabled = true
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+// ---------------------------------------------------------------- to Loki
+loki.write "default" {
+  endpoint {
+    url            = "{{ alloy_loki_url }}/loki/api/v1/push"
+    remote_timeout = "30s"
+    // Retry up to ~1 hour (worker1 is 160 ms away and its link can drop).
+    // Meanwhile the sources pause, so the files and the journal are read on
+    // once Loki answers again.
+    max_backoff_retries = 20
+  }
+}
+
+// ---------------------------------------------------------------- OTLP
+// Apps send to alloy.{{ observability_namespace }}.svc:4317 (gRPC) or :4318 (HTTP).
+otelcol.receiver.otlp "apps" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    traces  = [otelcol.processor.memory_limiter.apps.input]
+    logs    = [otelcol.processor.memory_limiter.apps.input]
+    metrics = [otelcol.processor.memory_limiter.apps.input]
+  }
+}
+
+otelcol.processor.memory_limiter "apps" {
+  check_interval         = "1s"
+  limit_percentage       = 80
+  spike_limit_percentage = 25
+  output {
+    traces  = [otelcol.processor.k8sattributes.apps.input]
+    logs    = [otelcol.processor.k8sattributes.apps.input]
+    metrics = [otelcol.processor.k8sattributes.apps.input]
+  }
+}
+
+// Adds the sender's namespace, pod, deployment, ... (found by its IP), which
+// links traces to the pod's logs in Grafana.
+otelcol.processor.k8sattributes "apps" {
+  extract {
+    metadata = [
+      "k8s.namespace.name",
+      "k8s.pod.name",
+      "k8s.pod.uid",
+      "k8s.node.name",
+      "k8s.deployment.name",
+      "k8s.statefulset.name",
+      "k8s.daemonset.name",
+      "k8s.cronjob.name",
+      "k8s.job.name",
+    ]
+  }
+  pod_association {
+    source {
+      from = "resource_attribute"
+      name = "k8s.pod.ip"
+    }
+  }
+  pod_association {
+    source {
+      from = "resource_attribute"
+      name = "k8s.pod.uid"
+    }
+  }
+  pod_association {
+    source {
+      from = "connection"
+    }
+  }
+  output {
+    traces  = [otelcol.processor.batch.apps.input]
+    logs    = [otelcol.processor.batch.apps.input]
+    metrics = [otelcol.processor.batch.apps.input]
+  }
+}
+
+otelcol.processor.batch "apps" {
+  output {
+    traces  = [otelcol.exporter.otlp.jaeger.input]
+    logs    = [otelcol.exporter.otlphttp.loki.input]
+    metrics = [otelcol.exporter.otlphttp.prometheus.input]
+  }
+}
+
+otelcol.exporter.otlp "jaeger" {
+  client {
+    endpoint    = "{{ alloy_jaeger_otlp_endpoint }}"
+    compression = "gzip"
+    tls {
+      insecure = true
+    }
+  }
+  sending_queue {
+    queue_size = 5000
+  }
+  retry_on_failure {
+    max_elapsed_time = "10m"
+  }
+}
+
+// Loki's native OTLP endpoint (/otlp/v1/logs)
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "{{ alloy_loki_url }}/otlp"
+  }
+}
+
+// Prometheus' OTLP endpoint (/api/v1/otlp/v1/metrics)
+otelcol.exporter.otlphttp "prometheus" {
+  client {
+    endpoint = "{{ alloy_prometheus_url }}/api/v1/otlp"
+  }
+}

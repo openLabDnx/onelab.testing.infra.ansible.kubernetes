@@ -1,0 +1,74 @@
+# Alloy NetworkPolicy and alerts (Managed by Ansible)
+# OTLP is open to every pod in the cluster (the apps); the UI/metrics port only
+# to Prometheus and to the other Alloy pods (clustering). Kubelet probes and the
+# node's own checks come from the pod's node, which is always allowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alloy
+  namespace: {{ observability_namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: alloy
+      app.kubernetes.io/instance: alloy
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - { port: 4317, protocol: TCP }
+        - { port: 4318, protocol: TCP }
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: prometheus }
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: alloy
+              app.kubernetes.io/instance: alloy
+      ports:
+        - { port: 12345, protocol: TCP }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: alloy
+  namespace: {{ observability_namespace }}
+spec:
+  groups:
+    - name: alloy
+      rules:
+        - alert: AlloyLogsDropped
+          expr: sum by (instance) (rate(loki_write_dropped_entries_total{job="alloy", namespace="{{ observability_namespace }}"}[10m])) > 0
+          labels: { severity: warning }
+          annotations:
+            summary: "Alloy on {{ '{{' }} $labels.instance }} drops log lines"
+            description: Loki refused them or stayed unreachable for longer than the retries (~1 hour). Those lines are lost.
+        - alert: AlloyLokiUnreachable
+          expr: sum by (instance) (rate(loki_write_batch_retries_total{job="alloy", namespace="{{ observability_namespace }}"}[10m])) > 0
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Alloy on {{ '{{' }} $labels.instance }} keeps retrying to send logs"
+            description: Loki is down, too slow or rate limiting. Logs are delayed (and dropped after ~1 hour).
+        - alert: AlloyTraceExportFailing
+          expr: sum by (instance) (rate(otelcol_exporter_send_failed_spans_total{job="alloy", namespace="{{ observability_namespace }}"}[10m])) > 0
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Alloy on {{ '{{' }} $labels.instance }} can't send traces to Jaeger"
+            description: Spans wait in a queue for up to 10 minutes, then are dropped.
+        - alert: AlloyComponentUnhealthy
+          expr: sum by (instance, health_type) (alloy_component_controller_running_components{job="alloy", namespace="{{ observability_namespace }}", health_type!="healthy"}) > 0
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Alloy on {{ '{{' }} $labels.instance }} has {{ '{{' }} $labels.health_type }} components"
+            description: Open the Alloy UI (kubectl port-forward the pod's port 12345) to see which one.
+        - alert: AlloyConfigReloadFailed
+          expr: alloy_config_last_load_successful{job="alloy", namespace="{{ observability_namespace }}"} == 0
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Alloy on {{ '{{' }} $labels.instance }} could not load its configuration"
+            description: It keeps running with the previous configuration.

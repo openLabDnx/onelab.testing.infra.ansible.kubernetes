@@ -1,0 +1,48 @@
+---
+- name: Find the Grafana API
+  ansible.builtin.include_role:
+    name: platform_vars
+    tasks_from: grafana_api.yaml
+
+# Through the NetworkPolicy, exactly like a user in Grafana > Explore.
+- name: Grafana reaches Jaeger
+  ansible.builtin.uri:
+    url: "{{ grafana_api }}/datasources/uid/jaeger/health"
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  register: jaeger_health
+  until: jaeger_health.status == 200 and jaeger_health.json.status == 'OK'
+  retries: 18
+  delay: 10
+  no_log: true
+
+# Checks through Cloudflare; skip with --skip-tags public.
+- name: The Jaeger UI asks for an authentik login
+  ansible.builtin.uri:
+    url: "https://{{ jaeger_host }}/search"
+    follow_redirects: none
+    status_code: [302]
+  register: jaeger_public
+  until: jaeger_public.location | default('') is search('^https://' ~ authentik_host ~ '/')
+  retries: 12
+  delay: 10
+  delegate_to: localhost
+  become: false
+  tags: [public]
+
+- name: Show Jaeger placement
+  ansible.builtin.command: >
+    {{ jaeger_kubectl }} get pod jaeger-0
+    -o custom-columns=POD:.metadata.name,READY:.status.containerStatuses[0].ready,NODE:.spec.nodeName --no-headers
+  register: jaeger_pod
+  changed_when: false
+
+- name: Display Jaeger summary
+  ansible.builtin.debug:
+    msg:
+      - "Jaeger {{ jaeger_image | regex_replace('^.*:', '') }}: {{ jaeger_pod.stdout }}; Grafana datasource: {{ jaeger_health.json.message }}"
+      - "Spans kept {{ jaeger_span_ttl }} in Badger ({{ jaeger_storage_size }} volume on {{ jaeger_storage_class }})"
+      - "UI: https://{{ jaeger_host }}/ (authentik, group {{ platform_admin_group }}); in Grafana: Explore > Jaeger"
+      - "Apps send OTLP to Alloy, not here: see roles/alloy"

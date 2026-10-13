@@ -10,6 +10,7 @@ traefik_dashboard_host: "traefik.{{ platform_domain }}"
 rabbitmq_host: "rabbitmq.{{ platform_domain }}"
 kafka_ui_host: "kafka.{{ platform_domain }}"
 grafana_host: "grafana.{{ platform_domain }}"
+jaeger_host: "jaeger.{{ platform_domain }}"
 
 authentik_namespace: "authentik"
 argocd_namespace: "argocd"
@@ -27,6 +28,7 @@ platform_forward_auth_apps:
   - { slug: traefik-dashboard, name: "Traefik dashboard", host: "{{ traefik_dashboard_host }}", launch_path: /dashboard/ }
   - { slug: rabbitmq, name: "RabbitMQ management", host: "{{ rabbitmq_host }}", launch_path: / }
   - { slug: kafka-ui, name: "Kafka UI", host: "{{ kafka_ui_host }}", launch_path: / }
+  - { slug: jaeger, name: "Jaeger", host: "{{ jaeger_host }}", launch_path: /search }
 
 # Generated credentials live here on the controller (git-ignored)
 platform_secrets_dir: "{{ inventory_dir }}/../secrets/platform"
@@ -38,6 +40,11 @@ grafana_oidc_client_id: "grafana"
 argocd_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/argocd_oidc_client_secret chars=ascii_letters,digits length=48') }}"
 portainer_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/portainer_oidc_client_secret chars=ascii_letters,digits length=48') }}"
 grafana_oidc_client_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/grafana_oidc_client_secret chars=ascii_letters,digits length=48') }}"
+
+# Grafana break-glass admin (people log in through authentik). The observability
+# roles also check their datasources through Grafana's API with it.
+grafana_admin_user: "admin"
+grafana_admin_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/grafana_admin_password chars=ascii_letters,digits length=32') }}"
 
 # Node sites. master and worker2 share a data centre (~1 ms); worker1 is ~160 ms
 # away. Database-backed apps (authentik + PostgreSQL, Argo CD, Portainer) run

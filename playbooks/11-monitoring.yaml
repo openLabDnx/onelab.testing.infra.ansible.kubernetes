@@ -1,8 +1,9 @@
 ---
-# Free Kafka/RabbitMQ monitoring instead of Confluent Control Center (license):
-# Prometheus + Grafana (SSO through authentik) with Strimzi and RabbitMQ
-# dashboards. Needs 09-platform and 10-messaging first.
-# Run one part with --tags authentik / kafka / monitoring.
+# Observability, free instead of Confluent Control Center (license):
+# metrics (Prometheus, node-exporter, kube-state-metrics), logs (Loki) and
+# traces (Jaeger), collected on every node by Grafana Alloy and shown in Grafana
+# (SSO through authentik). Needs 09-platform and 10-messaging first.
+# Run one part with --tags authentik / kafka / monitoring / loki / jaeger / alloy.
 - name: Label nodes by site
   hosts: "{{ groups['rke2_servers'][0] }}"
   become: yes
@@ -14,9 +15,9 @@
         name: platform_vars
         tasks_from: label_nodes.yaml
 
-# Adds the Grafana OIDC client (config Secret + blueprint); restarts authentik
-# once when its configuration changes.
-- name: authentik SSO app for Grafana
+# Adds the Grafana OIDC client (config Secret + blueprint) and the Jaeger
+# forward-auth app; restarts authentik once when its configuration changes.
+- name: authentik SSO apps for Grafana and Jaeger
   hosts: "{{ groups['rke2_servers'][0] }}"
   become: yes
   gather_facts: no
@@ -33,6 +34,7 @@
   roles:
     - kafka
 
+# Also provisions the Loki and Jaeger datasources, so it runs before them.
 - name: Prometheus + Grafana
   hosts: "{{ groups['rke2_servers'][0] }}"
   become: yes
@@ -40,3 +42,41 @@
   tags: [monitoring]
   roles:
     - monitoring
+
+- name: Loki (logs)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [loki]
+  roles:
+    - loki
+
+# The Jaeger UI's forward-auth provider lives in the platform blueprint.
+- name: authentik forward-auth app for Jaeger
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [jaeger, authentik]
+  tasks:
+    - name: Publish and apply the platform blueprint
+      ansible.builtin.include_role:
+        name: authentik
+        tasks_from: blueprint.yaml
+
+- name: Jaeger (traces)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [jaeger]
+  roles:
+    - jaeger
+
+# Last: ships logs and traces to Loki and Jaeger, then checks the whole path
+# end to end (node logs, events, a test log line and trace, through Grafana).
+- name: Grafana Alloy (log and trace collection)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [alloy]
+  roles:
+    - alloy

@@ -4,6 +4,11 @@
 alertmanager:
   enabled: false
 
+defaultRules:
+  disabled:
+    # always firing while there is no Alertmanager
+    PrometheusNotConnectedToAlertmanagers: true
+
 # RKE2 runs these on 127.0.0.1 only: scraping them would just show them as down
 # and fire false "component down" alerts.
 kubeEtcd: { enabled: false }
@@ -19,6 +24,29 @@ kube-state-metrics:
   nodeSelector:
     {{ platform_primary_site_selector | to_nice_yaml | trim | indent(4) }}
 
+# Only Linux nodes here: no AIX / macOS node dashboards.
+nodeExporter:
+  operatingSystems:
+    aix: { enabled: false }
+    darwin: { enabled: false }
+
+# node-exporter needs the host network, and the nodes' IPs are public: without
+# this anyone could read /metrics on <node>:9100. node-exporter now listens on
+# 127.0.0.1:8100 and kube-rbac-proxy serves :9100 over TLS, answering only
+# clients whose token may "get services/<node-exporter>" (Prometheus).
+prometheus-node-exporter:
+  kubeRBACProxy:
+    enabled: true
+    resources:
+      requests: { cpu: 10m, memory: 20Mi }
+      limits: { memory: 64Mi }
+  prometheus:
+    monitor:
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true          # kube-rbac-proxy's self-signed certificate; the token is the check
+
 prometheus:
   prometheusSpec:
     # pick up every ServiceMonitor/PodMonitor/PrometheusRule in the cluster
@@ -27,6 +55,17 @@ prometheus:
     ruleSelectorNilUsesHelmValues: false
     retention: {{ prometheus_retention }}
     retentionSize: {{ prometheus_retention_size }}
+    # exemplars (trace_id on histogram samples, e.g. Jaeger's span metrics) link
+    # Grafana graphs to the trace in Jaeger
+    enableFeatures: [exemplar-storage]
+    # OTLP metrics from the apps, through Alloy: /api/v1/otlp/v1/metrics
+    enableOTLPReceiver: true
+    otlp:
+      promoteResourceAttributes: {{ prometheus_otlp_promote_resource_attributes | to_json }}
+      keepIdentifyingResourceAttributes: true
+    tsdb:
+      # OTLP batches from several Alloy pods can arrive slightly out of order
+      outOfOrderTimeWindow: 10m
     nodeSelector:
       {{ platform_primary_site_selector | to_nice_yaml | trim | indent(6) }}
     resources:
@@ -58,9 +97,12 @@ grafana:
       wal: true
     auth:
       signout_redirect_url: https://{{ authentik_host }}/application/o/grafana/end-session/
-    # SSO through authentik; platform-admins become Grafana Admin, anyone else Viewer
+    # SSO through authentik; platform-admins become Grafana Admin, anyone else Viewer.
+    # auto_login: the login page goes straight to authentik, so the Grafana tile in
+    # authentik opens Grafana signed in. Break-glass form: /login?disableAutoLogin
     auth.generic_oauth:
       enabled: true
+      auto_login: true
       name: authentik
       client_id: {{ grafana_oidc_client_id }}
       scopes: openid profile email
@@ -73,6 +115,68 @@ grafana:
       email_attribute_path: email
       role_attribute_path: "contains(groups, '{{ platform_admin_group }}') && 'Admin' || 'Viewer'"
       allow_sign_up: true
+  # Datasources are provisioned only: remove any that are no longer listed.
+  # prune only covers datasources provisioned with it, so the Alertmanager one
+  # (from before, while Alertmanager is off) is deleted by name.
+  prune: true
+  deleteDatasources:
+    - { name: Alertmanager, orgId: 1 }
+  # Logs and traces. In these provisioning values "$$" is a literal "$".
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      url: {{ loki_url }}
+      access: proxy
+      editable: false
+      jsonData:
+        maxLines: 1000
+        timeout: 120
+        # trace_id structured metadata (Alloy extracts it from log lines, OTLP
+        # logs carry it) -> "Open trace" button in the log details
+        derivedFields:
+          - name: trace_id
+            matcherType: label
+            matcherRegex: trace_id
+            datasourceUid: jaeger
+            url: "$${__value.raw}"
+            urlDisplayLabel: Open trace in Jaeger
+    - name: Jaeger
+      type: jaeger
+      uid: jaeger
+      url: {{ jaeger_query_url }}
+      access: proxy
+      editable: false
+      jsonData:
+        # span -> its logs: same namespace, same trace_id (+-5 min around the span)
+        tracesToLogsV2:
+          datasourceUid: loki
+          spanStartTimeShift: "-5m"
+          spanEndTimeShift: "5m"
+          tags:
+            - { key: k8s.namespace.name, value: namespace }
+          customQuery: true
+          query: '{$${__tags}} | trace_id="$${__span.traceId}"'
+        # span -> request rate / errors / latency from Jaeger's span metrics
+        tracesToMetrics:
+          datasourceUid: prometheus
+          spanStartTimeShift: "-10m"
+          spanEndTimeShift: "10m"
+          tags:
+            - { key: service.name, value: service_name }
+          queries:
+            - name: Request rate
+              query: 'sum(rate(traces_span_metrics_calls_total{$$__tags}[5m]))'
+            - name: Error rate
+              query: 'sum(rate(traces_span_metrics_calls_total{$$__tags, status_code="STATUS_CODE_ERROR"}[5m]))'
+            - name: p95 latency (ms)
+              query: 'histogram_quantile(0.95, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{$$__tags}[5m])))'
+        nodeGraph:
+          enabled: true
+        traceIdTimeParams:
+          enabled: true
+        spanBar:
+          type: Duration
   ingress:
     enabled: true
     ingressClassName: traefik
@@ -90,8 +194,19 @@ grafana:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { memory: 768Mi }
   sidecar:
+    datasources:
+      alertmanager:
+        enabled: false
+      # Prometheus exemplars with a trace_id link to the trace in Jaeger
+      exemplarTraceIdDestinations:
+        datasourceUid: jaeger
+        traceIdLabelName: trace_id
+        urlDisplayLabel: Open trace in Jaeger
     dashboards:
       searchNamespace: ALL
       folderAnnotation: grafana_folder
       provider:
         foldersFromFilesStructure: true
+      # the chart's own Kubernetes / node / Prometheus dashboards
+      annotations:
+        grafana_folder: Kubernetes

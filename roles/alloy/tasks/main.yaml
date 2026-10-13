@@ -1,0 +1,40 @@
+---
+- name: Install / upgrade Grafana Alloy
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: alloy
+    release_namespace: "{{ observability_namespace }}"
+    create_namespace: true
+    chart_repo_url: "{{ alloy_chart_repo_url }}"
+    chart_ref: alloy
+    chart_version: "{{ alloy_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # return right away and poll the rollout below (see roles/authentik)
+    wait: false
+
+- name: Wait for Alloy on every node
+  ansible.builtin.command: "{{ alloy_kubectl }} rollout status daemonset/alloy --timeout=600s"
+  register: alloy_rollout
+  until: alloy_rollout.rc == 0
+  retries: 6
+  delay: 10
+  changed_when: false
+
+# Server-side diff/apply: client-side apply reports the PrometheusRule as changed every run.
+- name: Check Alloy NetworkPolicy and alerts for drift
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'extras.yaml.j2') }}"
+  register: alloy_extras_diff
+  changed_when: false
+  failed_when: alloy_extras_diff.rc > 1
+
+- name: Apply Alloy NetworkPolicy and alerts
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'extras.yaml.j2') }}"
+  when: alloy_extras_diff.rc == 1
+
+- name: Verify logs and traces end to end
+  ansible.builtin.import_tasks: verify.yaml

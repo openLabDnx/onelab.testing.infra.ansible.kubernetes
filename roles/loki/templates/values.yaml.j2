@@ -1,0 +1,159 @@
+# Loki Helm values (Managed by Ansible)
+# Monolithic (single binary), 1 replica, filesystem storage on a node-local PVC,
+# single tenant. In-cluster URL: http://loki.{{ observability_namespace }}.svc.cluster.local:3100
+deploymentMode: Monolithic
+
+loki:
+  # single tenant: everything is stored as tenant "fake", no X-Scope-OrgID needed
+  auth_enabled: false
+  commonConfig:
+    path_prefix: /var/loki
+    # the chart default (3) needs three ingesters
+    replication_factor: 1
+  storage:
+    type: filesystem
+    filesystem:
+      chunks_directory: /var/loki/chunks
+      rules_directory: /var/loki/rules
+  # Never edit an existing entry: a schema change is a NEW entry whose "from" is
+  # a future date.
+  schemaConfig:
+    configs:
+      - from: "2025-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+  ingester:
+    chunk_encoding: snappy
+    wal:
+      flush_on_shutdown: true
+      # the default (4GB) is above the memory limit
+      replay_memory_ceiling: 1GB
+  # "Patterns" in Grafana's Logs Drilldown; cheap at this volume
+  pattern_ingester:
+    enabled: true
+  # query results cache in memory instead of memcached
+  query_range:
+    cache_results: true
+    results_cache:
+      cache:
+        embedded_cache:
+          enabled: true
+          max_size_mb: 64
+          ttl: 1h
+  compactor:
+    working_directory: /var/loki/compactor
+    compaction_interval: 10m
+    retention_enabled: true
+    retention_delete_delay: 2h
+    retention_delete_worker_count: 150
+    delete_request_store: filesystem     # required with retention
+  limits_config:
+    retention_period: {{ loki_retention_period }}
+    max_query_lookback: {{ loki_retention_period }}
+    ingestion_rate_mb: {{ loki_ingestion_rate_mb }}
+    ingestion_burst_size_mb: {{ loki_ingestion_burst_size_mb }}
+    per_stream_rate_limit: {{ loki_per_stream_rate_limit }}
+    per_stream_rate_limit_burst: {{ loki_per_stream_rate_limit_burst }}
+    max_line_size: 256KB
+    max_line_size_truncate: true         # keep oversized lines, truncated
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+    max_query_series: 1000
+    query_timeout: 2m
+    split_queries_by_interval: 1h
+    max_cache_freshness_per_query: 10m
+    # Grafana Logs Drilldown: volume panels, structured metadata, log levels
+    volume_enabled: true
+    allow_structured_metadata: true
+    discover_log_levels: true
+  analytics:
+    reporting_enabled: false
+
+singleBinary:
+  replicas: 1
+  # rules sidecar only serves the ruler, which is off
+  sidecar: false
+  persistence:
+    enabled: true
+    size: {{ loki_storage_size }}
+    storageClass: {{ loki_storage_class }}
+    accessModes: [ReadWriteOnce]
+    enableStatefulSetAutoDeletePVC: false
+  resources:
+    {{ loki_resources | to_nice_yaml(indent=2) | trim | indent(4) }}
+  # one pod: no PodDisruptionBudget, so it never blocks a node drain
+  podDisruptionBudget:
+    enabled: false
+  # primary site (Grafana and Prometheus are there too), away from the 12 GiB
+  # control-plane node when there is room; replaces the chart's anti-affinity
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: {{ platform_node_site_label }}
+                operator: In
+                values: [{{ platform_primary_site }}]
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
+
+# the chart refuses Monolithic together with read/write/backend replicas
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+# one memberlist member: list the pod before it is Ready so its startup join
+# never waits for readiness
+memberlist:
+  service:
+    publishNotReadyAddresses: true
+
+gateway:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+chunksCache:
+  enabled: false                         # the default would request ~9.6 GiB for memcached
+resultsCache:
+  enabled: false
+minio:
+  enabled: false
+ruler:
+  enabled: false
+sidecar:
+  rules:
+    enabled: false
+
+# Loki never calls the Kubernetes API once the rules sidecar is off
+rbac:
+  namespaced: true
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+defaults:
+  automountServiceAccountToken: false
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  # The chart's mixin dashboards, recording rules and alerts expect labels this
+  # deployment doesn't have (app_instance, cluster); roles/loki ships its own alerts.
+  rules:
+    enabled: false
+  alerts:
+    enabled: false
+  dashboards:
+    enabled: false

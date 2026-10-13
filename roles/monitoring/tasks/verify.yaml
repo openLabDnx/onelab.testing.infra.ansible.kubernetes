@@ -24,6 +24,18 @@
   retries: 30
   delay: 10
 
+# Scraped through kube-rbac-proxy (HTTPS + Prometheus' token) on every node.
+- name: Wait until node-exporter is scraped on every node
+  ansible.builtin.uri:
+    url: "{{ prometheus_api }}/query?query={{ 'count(up{job=\"node-exporter\"} == 1)' | urlencode }}"
+    return_content: true
+  register: monitoring_node_targets
+  until: >-
+    monitoring_node_targets.json.data.result | length > 0
+    and monitoring_node_targets.json.data.result[0].value[1] | int == groups['rke2_cluster'] | length
+  retries: 18
+  delay: 10
+
 - name: Read key metrics
   ansible.builtin.uri:
     url: "{{ prometheus_api }}/query?query={{ item.query | urlencode }}"
@@ -50,9 +62,26 @@
   loop_control:
     label: "{{ item.item.name }}"
 
+# From the controller, i.e. from the internet: no token, no metrics.
+# Skip with --skip-tags public.
+- name: node-exporter refuses anonymous requests on the public IPs
+  ansible.builtin.uri:
+    url: "https://{{ hostvars[item]['node_external_ip'] | default(hostvars[item]['ansible_host']) }}:9100/metrics"
+    validate_certs: false
+    status_code: [401]
+    timeout: 15
+  register: monitoring_public_node_exporter
+  until: monitoring_public_node_exporter.status == 401
+  retries: 6
+  delay: 10
+  loop: "{{ groups['rke2_cluster'] }}"
+  delegate_to: localhost
+  become: false
+  tags: [public]
+
 - name: List Grafana dashboards
   ansible.builtin.uri:
-    url: "{{ grafana_api }}/search?type=dash-db&limit=500"
+    url: "{{ grafana_api }}/search?type=dash-db&limit=5000"
     url_username: "{{ grafana_admin_user }}"
     url_password: "{{ grafana_admin_password }}"
     force_basic_auth: true
@@ -60,9 +89,37 @@
   register: monitoring_dashboards_list
   until: >-
     monitoring_dashboards_list.status == 200 and
-    (monitoring_dashboards_list.json | selectattr('title', 'search', '^(Strimzi|RabbitMQ)') | list | length) >= monitoring_dashboards | length
+    (monitoring_dashboards_list.json | selectattr('folderTitle', 'defined')
+     | selectattr('folderTitle', 'in', monitoring_dashboards | map(attribute='folder') | list) | list | length)
+    >= monitoring_dashboards | length
   retries: 18
   delay: 10
+  no_log: true
+
+- name: Every dashboard folder holds its dashboards
+  ansible.builtin.assert:
+    that: >-
+      (monitoring_dashboards_list.json | selectattr('folderTitle', 'defined')
+       | selectattr('folderTitle', 'equalto', item.key) | list | length) >= item.value
+    fail_msg: "Grafana folder {{ item.key }} has fewer than {{ item.value }} dashboards"
+    quiet: true
+  loop: "{{ monitoring_dashboards | map(attribute='folder') | community.general.counter | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# Grafana's sidecar re-provisions the datasources a few seconds after a change.
+- name: Read the provisioned datasources
+  ansible.builtin.uri:
+    url: "{{ grafana_api }}/datasources"
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  register: monitoring_datasources
+  until: monitoring_datasources.json | map(attribute='uid') | sort == ['jaeger', 'loki', 'prometheus']
+  retries: 12
+  delay: 10
+  failed_when: false
   no_log: true
 
 - name: Check monitoring
@@ -73,14 +130,19 @@
       - monitoring_values.under_replicated == 0
       - monitoring_values.offline_partitions == 0
       - monitoring_values.rabbitmq_nodes == monitoring_expected_rabbitmq_nodes
-    fail_msg: "monitoring check failed: {{ monitoring_values | to_json }}"
+      - monitoring_values.nodes_scraped == groups['rke2_cluster'] | length
+      - monitoring_datasources.json | map(attribute='uid') | sort == ['jaeger', 'loki', 'prometheus']
+    fail_msg: >-
+      monitoring check failed: {{ monitoring_values | to_json }},
+      datasources {{ monitoring_datasources.json | map(attribute='uid') | list }}
     quiet: true
 
 - name: Display monitoring summary
   ansible.builtin.debug:
     msg:
-      - "Prometheus: {{ monitoring_values.targets_up }} Kafka/RabbitMQ targets up, {{ monitoring_values.targets_down }} down; {{ monitoring_values.nodes_scraped }} nodes"
+      - "Prometheus: {{ monitoring_values.targets_up }} Kafka/RabbitMQ targets up, {{ monitoring_values.targets_down }} down; {{ monitoring_values.nodes_scraped }} nodes (node-exporter behind kube-rbac-proxy, anonymous :9100 refused)"
       - "Kafka: {{ monitoring_values.kafka_brokers }} brokers, {{ monitoring_values.under_replicated }} under-replicated, {{ monitoring_values.offline_partitions }} offline partitions"
       - "RabbitMQ: {{ monitoring_values.rabbitmq_nodes }} nodes"
-      - "Dashboards: {{ monitoring_dashboards_list.json | selectattr('title', 'search', '^(Strimzi|RabbitMQ)') | map(attribute='title') | sort | join(', ') }}"
-      - "Grafana: https://{{ grafana_host }}/ (Sign in with authentik; break-glass admin / {{ platform_secrets_dir }}/grafana_admin_password)"
+      - "Dashboards: {{ monitoring_dashboards | length }} in folders {{ monitoring_dashboards | map(attribute='folder') | unique | join(', ') }} (+ the chart's own in Kubernetes)"
+      - "Datasources: {{ monitoring_datasources.json | map(attribute='name') | sort | join(', ') }}"
+      - "Grafana: https://{{ grafana_host }}/ (signs in through authentik; break-glass https://{{ grafana_host }}/login?disableAutoLogin as admin / {{ platform_secrets_dir }}/grafana_admin_password)"
