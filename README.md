@@ -29,7 +29,7 @@ autofik.infra.testing/
 │   ├── rke2_servers.yaml        # Master control-plane variables & ports
 │   └── rke2_agents.yaml         # Worker agent variables & ports
 ├── roles/
-│   ├── common/                  # System prep: swap off, sysctl, kernel modules, /etc/hosts
+│   ├── common/                  # System prep: swap off, sysctl, kernel modules, /etc/hosts, Longhorn node prerequisites
 │   │   ├── tasks/main.yaml
 │   │   └── handlers/main.yaml
 │   ├── rke2_server/             # Master install, config, systemd service, kubeconfig export
@@ -40,7 +40,8 @@ autofik.infra.testing/
 │   │   ├── tasks/main.yaml
 │   │   ├── handlers/main.yaml
 │   │   └── templates/config.yaml.j2
-│   ├── local_path_provisioner/  # StorageClasses local-path + local-path-retain
+│   ├── longhorn/                # Longhorn: StorageClasses, node tags, smoke test, UI behind SSO, status
+│   ├── local_path_migration/    # One-time move of local-path volumes onto Longhorn (same claim names)
 │   ├── vault/                   # Vault HA: helm, TLS, deploy, init, unseal, status, reset
 │   │   ├── defaults/main.yaml   # Versions, replicas, storage, UI exposure, key shares
 │   │   ├── tasks/
@@ -72,7 +73,10 @@ autofik.infra.testing/
 │   ├── 02-rke2-server.yaml      # Master control-plane deployment
 │   ├── 03-rke2-agent.yaml       # Worker nodes deployment
 │   ├── 04-verify.yaml           # Cluster health & pod status check
-│   ├── 05-storage.yaml          # local-path-provisioner (PersistentVolumes)
+│   ├── 05-storage.yaml          # Longhorn (PersistentVolumes): node prerequisites, StorageClasses, UI
+│   ├── longhorn-status.yaml     # Longhorn nodes and volumes
+│   ├── storage-migrate.yaml     # Move volumes still on local-path to Longhorn (asks to confirm)
+│   ├── local-path-remove.yaml   # Remove local-path-provisioner once unused (asks to confirm)
 │   ├── 06-vault.yaml            # Vault HA deploy + init + unseal + verify
 │   ├── vault-unseal.yaml        # Unseal Vault pods after restarts
 │   ├── vault-status.yaml        # Vault pods, seal state, raft peers
@@ -181,6 +185,58 @@ ansible-playbook playbooks/reset.yaml
 
 ---
 
+## 💾 Storage: Longhorn
+
+Every PersistentVolume is a **Longhorn** volume (1.12.1, the newest release Longhorn marks *Stable*), kept on the nodes' root disks under `/var/lib/longhorn`. It replaces local-path-provisioner.
+
+| StorageClass | Copies | Used by | Why |
+| :--- | :--- | :--- | :--- |
+| `longhorn-local-retain` | 1, on the pod's node; the pod stays on that node | Vault, etcd (APISIX), Kafka, RabbitMQ, PostgreSQL (authentik) | the app keeps its own copies on the other nodes; a second Longhorn copy would only double every write |
+| `longhorn-retain` | 2, on master + worker2 (`eu`) | Prometheus, Grafana, Loki, Jaeger, Portainer, authentik backups | apps that run one copy: after a node failure the pod starts on the other `eu` node with its data |
+| `longhorn` (cluster default) | 2, on `eu` | claims without a class | deleted with its claim |
+
+Both classes used by the roles keep the volume when its claim is deleted (`Retain`), like `local-path-retain` did. No copy goes to worker1: every write waits for every copy, and worker1 is ~160 ms away (Longhorn node tags = the node's site).
+
+```bash
+make storage          # node prerequisites, Longhorn, StorageClasses, smoke test, UI behind SSO (safe to re-run)
+make longhorn-status  # nodes (ready, tags) and volumes (state, health, copies, node, size)
+```
+- **Nodes** (also part of `make prep`): open-iscsi, nfs-common and cryptsetup installed, `iscsi_tcp`/`dm_crypt` loaded, **multipathd turned off** (it grabs the iSCSI disks Longhorn attaches; the run stops instead if a node uses multipath devices), **rpcbind masked** (nfs-common pulls it in, and it would listen on port 111 on the public IPs; NFSv4 doesn't need it). The run fails if any node fails Longhorn's own checks.
+- **Smoke test:** at the end of `make storage`, a pod on every node writes to its own volume, then the copies are checked: the local class on the pod's node (and pinned there), the replicated class on two different `eu` nodes.
+- **UI:** https://longhorn.testing.autofik.com behind authentik (`platform-admins`, tile *Longhorn*). The UI and the API behind it have no login: NetworkPolicies let only Traefik reach the UI and only Longhorn's own components (and Prometheus, for `/metrics`) reach the managers. Published by `make storage` once authentik exists, otherwise by `make platform`.
+- **Monitoring:** Grafana folder *Storage* (dashboard *Longhorn Monitoring & Backups*); alerts for degraded, faulted or read-only volumes, volumes over 90% full, disks over 70%, nodes down.
+- **Space:** volumes are thin. Their sizes add up to ~170 GiB per `eu` node against ~135 GiB that Longhorn may use on the master's 193 GiB disk, so over-provisioning is 200%; real use is a few GB. The disk alerts fire long before a disk fills.
+
+### Moving the existing volumes off local-path (one time)
+```bash
+make storage            # Longhorn and its classes first
+make storage-migrate    # asks to confirm; every app in turn (one app: ansible-playbook playbooks/storage-migrate.yaml --tags vault)
+make local-path-remove  # asks to confirm; only once every claim is on Longhorn
+```
+For each app: stop it, copy each volume into a new Longhorn volume (a Job on the volume's node: `cp -a`, then the file list, owners, modes and the SHA-256 of every file are compared), put the claim back under the **same name, labels and owners** on the new volume, start the app, and run its role, which checks it end to end. Each app is down for a few minutes:
+
+| `--tags` | Down while it moves | Notes |
+| :--- | :--- | :--- |
+| `observability` | Grafana, Prometheus, Loki, Jaeger | Alloy keeps the logs and resends them |
+| `portainer` | Portainer | |
+| `authentik` | SSO logins (PostgreSQL hibernated) | database backups paused meanwhile |
+| `vault` | Vault (all 3 members) | the role unseals it afterwards (needs `secrets/vault/vault-init.json`) |
+| `apisix` | APISIX config changes (etcd) | the gateway keeps serving its routes from memory |
+| `rabbitmq` | RabbitMQ | clients reconnect |
+| `kafka` | Kafka | |
+
+Re-runs skip the claims already moved, and a run that failed resumes where it stopped (state in `/opt/autofik/migration` on the master). The old local-path volumes are kept (`Retain`, label `autofik.com/migrated-to-longhorn`) as a fallback until `make local-path-remove`, and their data stays in `/opt/local-path-provisioner` unless you add `-e local_path_purge_data=true`. Directories there that belong to no migrated volume (worker1 has some from an earlier setup) are never touched.
+
+### Operations
+- **Node maintenance:** `kubectl drain` works: pods are evicted and one-copy volumes stop with them (`nodeDrainPolicy: allow-if-replica-is-stopped`). Bring the node back; never delete a node that holds the only copy of a volume.
+- **Node down:** pods on it are deleted once it is NotReady, so two-copy volumes come back on the other `eu` node. One-copy volumes wait for their node; the apps on them keep running on their other members.
+- **Node lost for good:** delete the claims of the one-copy volumes it held (and their volumes in the UI); the StatefulSet member starts empty on another node and the app copies its data back.
+- **Grow a volume:** raise the size of the claim (`kubectl edit pvc`); Longhorn grows it online. Also raise the size in the role's defaults.
+- **Backups:** there is no backup target yet (no S3/NFS), and snapshots are not backups. Once object storage exists, set it under Settings → Backup Target in the UI.
+- **Upgrades:** bump `longhorn_version` in `roles/longhorn/defaults/main.yaml`, read that release's important notes, then `make storage`. Longhorn upgrades one minor version at a time.
+
+---
+
 ## 🔐 HashiCorp Vault (HA)
 
 Vault runs inside the RKE2 cluster as a 3-member Raft cluster with **one pod per node**, so it keeps serving if any single node goes down (Raft quorum = 2 of 3).
@@ -188,7 +244,7 @@ Vault runs inside the RKE2 cluster as a 3-member Raft cluster with **one pod per
 | Item | Setting |
 | :--- | :--- |
 | Chart / Vault | `hashicorp/vault` `0.34.1` / Vault `2.0.4` |
-| Storage | Raft integrated storage, 10Gi per pod on `local-path-retain` (node-local disk, `Retain`) |
+| Storage | Raft integrated storage, 10Gi per pod on `longhorn-local-retain` (one Longhorn copy on the pod's node, `Retain`; Raft keeps the 3 copies) |
 | TLS | End-to-end HTTPS, self-signed CA generated by Ansible in `secrets/vault/tls/` |
 | Unseal | Shamir: 5 key shares, threshold 3 |
 | Services | `vault-active` (leader), `vault-standby`, `vault` (ClusterIP, not public) |
@@ -196,7 +252,7 @@ Vault runs inside the RKE2 cluster as a 3-member Raft cluster with **one pod per
 
 ### Deploy
 ```bash
-make vault          # local-path-provisioner -> Vault -> init -> unseal -> verify (safe to re-run)
+make vault          # Longhorn -> Vault -> init -> unseal -> verify (safe to re-run)
 make vault-status   # pods, seal state, active node, raft peers
 ```
 
@@ -321,7 +377,7 @@ client ──HTTPS──▶ Cloudflare edge ──tunnel──▶ cloudflared �
 | :--- | :--- |
 | Chart / APISIX | `apisix/apisix` `2.17.0` / APISIX `3.18.0`, the same pins as the master cluster |
 | Gateway | 2-3 pods (HPA on CPU 70%, scales by 1 at a time), spread across nodes, PDB `minAvailable: 1`, zero-downtime rolling updates |
-| Config store | etcd 3 members, one per node (hard anti-affinity), 8Gi each on `local-path-retain`, keeps working with 1 node down |
+| Config store | etcd 3 members, one per node (hard anti-affinity), 8Gi each on `longhorn-local-retain`, keeps working with 1 node down |
 | Public URLs | API: `https://api.testing.autofik.com` → `apisix-gateway:80`<br>Dashboard: `https://apisix.testing.autofik.com/ui/` → `apisix-admin:9180`, behind Cloudflare Access |
 | Client IP | `remote_addr` = `CF-Connecting-IP`, trusted only from the pod network, so `limit-count` / `ip-restriction` see the real user |
 | Admin API / UI | port 9180, ClusterIP; NetworkPolicy lets only the `cloudflared` pods in (plus `make apisix-admin` port-forward). Behind Cloudflare, `remote_addr` is the visitor's IP, so the nginx IP allow-list is open and protection is NetworkPolicy + Cloudflare Access + admin key (`apisix_admin_via_cloudflared: false` restores localhost-only) |
@@ -379,6 +435,7 @@ Every UI is published under `*.testing.autofik.com`. The Cloudflare tunnel alrea
 | https://kafka.testing.autofik.com | Kafka UI (kafbat, read-only) | authentik forward-auth |
 | https://grafana.testing.autofik.com | Grafana (metrics, logs, traces, dashboards) | **authentik, automatically** (also from the Grafana tile in authentik); break-glass `admin` / `secrets/platform/grafana_admin_password` at `/login?disableAutoLogin` |
 | https://jaeger.testing.autofik.com | Jaeger (traces) | authentik forward-auth (no login of its own) |
+| https://longhorn.testing.autofik.com | Longhorn (volumes, nodes, snapshots) | authentik forward-auth (no login of its own) |
 
 Only members of the authentik group **`platform-admins`** can open these apps (`akadmin` is in it); anyone else gets authentik's "Permission denied". Argo CD maps that group to `role:admin`. In Portainer, SSO users land in team `sso-users` **with no environment access**; usernames listed in `portainer_admin_users` (`roles/portainer/defaults/main.yaml`, default `akadmin`) are made Portainer administrators after their first SSO login and a re-run of `make portainer`.
 
@@ -395,7 +452,7 @@ make portainer   # Portainer + SSO
 - **authentik:** 2 server + 2 worker pods with PDBs. All settings and credentials come from a Secret (no inline env passwords, no superuser API token). SSO apps, groups and forward-auth providers are declared in a **blueprint** (`roles/authentik/templates/platform-blueprint.yaml.j2`); change them there, not by hand.
 - **PostgreSQL for authentik:** CloudNativePG (operator ×2), 2 instances (primary + synchronous standby) with automatic failover. **Daily `pg_dump`** at 02:30 UTC to the PVC `authentik-db-backups`, kept 14 days.
 - **Argo CD:** HA (2 server, 2 repo-server, 2 ApplicationSet, Redis HA with Sentinel). OIDC with authentik plus RBAC (`policy.default` = nothing). The admin password hash is kept, so re-runs don't log anyone out.
-- **Portainer:** CE 2.45.1, data on `local-path-retain`, **database encrypted at rest**, SSO through authentik, trusted origin set for the proxy.
+- **Portainer:** CE 2.45.1, data on `longhorn-retain` (two copies), **database encrypted at rest**, SSO through authentik, trusted origin set for the proxy.
 
 ### Node sites
 master and worker2 share a data centre (~1 ms). **worker1 is ~160 ms away.** Nodes are labelled `autofik.com/site=eu|ap`. authentik, its PostgreSQL, Argo CD and Portainer run only on `eu`: a database client 160 ms from its database spends seconds per request.
@@ -495,13 +552,13 @@ OTEL_METRICS_EXPORTER=otlp       # lands in Prometheus (or keep exposing /metric
 ### How it is built for this cluster
 | | Runs on | Requests / limit | Storage |
 | :--- | :--- | :--- | :--- |
-| Loki 3.7.8 (chart 18.13.7, monolithic) | 1 pod, `eu` site, preferably not the 12 GB master | 250m, 1 GiB / 2 GiB | 50 Gi `local-path-retain`, 30 days retention by the compactor |
-| Jaeger 2.20.0 (Badger storage; 2.21+ drops the API Grafana uses) | 1 pod, `eu` site, preferably not the master | 100m, 256 MiB / 1 GiB | 20 Gi `local-path-retain`, spans kept 7 days |
+| Loki 3.7.8 (chart 18.13.7, monolithic) | 1 pod, `eu` site, preferably not the 12 GB master | 250m, 1 GiB / 2 GiB | 50 Gi `longhorn-retain` (two copies on the `eu` nodes), 30 days retention by the compactor |
+| Jaeger 2.20.0 (Badger storage; 2.21+ drops the API Grafana uses) | 1 pod, `eu` site, preferably not the master | 100m, 256 MiB / 1 GiB | 20 Gi `longhorn-retain` (two copies on the `eu` nodes), spans kept 7 days |
 | Alloy v1.20.0 (chart 1.13.0) | every node (DaemonSet) | 50m, 128 MiB / 512 MiB | read positions in `/var/lib/alloy` on the node |
 | Prometheus, Grafana | `eu` site | unchanged | unchanged |
 
-- **One Loki and one Jaeger:** with only node-local disks (no S3/object storage), each can run only one copy. If its node goes down, logs and traces stop being stored until it is back. Alloy keeps retrying for about an hour, and file and journal logs are read on from where Alloy stopped, so they arrive late but aren't lost. Spans are queued for 10 minutes only. Real HA needs object storage (S3/MinIO) for Loki and an OpenSearch/ClickHouse backend for Jaeger.
-- **Disk:** `local-path` doesn't enforce volume sizes, and the node disks are shared. Volume is limited by retention and Loki's ingestion limits (`roles/loki/defaults/main.yaml`). The node-exporter alerts *NodeFilesystemSpaceFillingUp* / *AlmostOutOfSpace* warn before a disk fills. Today's raw logs are about 0.5 GB/day, which takes a few GB compressed over 30 days.
+- **One Loki and one Jaeger:** without object storage (S3) each can run only one copy. Its Longhorn volume has a second copy on the other `eu` node: if its node goes down, Longhorn deletes the stuck pod once the node is NotReady and it starts on the other node with its data, a few minutes later; meanwhile logs and traces are not stored. Alloy keeps retrying for about an hour, and file and journal logs are read on from where Alloy stopped, so they arrive late but aren't lost. Spans are queued for 10 minutes only. Real HA needs object storage (S3/MinIO) for Loki and an OpenSearch/ClickHouse backend for Jaeger.
+- **Disk:** each volume has a fixed size (grow it by raising the claim's size, Longhorn expands online), and Longhorn shares the nodes' root disks. Volume use is limited by retention and Loki's ingestion limits (`roles/loki/defaults/main.yaml`). *LonghornVolumeActualSpaceUsedWarning*, *LonghornDiskStorageWarning* and the node-exporter alerts *NodeFilesystemSpaceFillingUp* / *AlmostOutOfSpace* warn before anything fills up. Today's raw logs are about 0.5 GB/day, which takes a few GB compressed over 30 days.
 - **worker1 is 160 ms away:** its Alloy batches and compresses before sending, and apps there talk to the Alloy on their own node.
 - **Security:**
   - node-exporter needs the host network, and the node IPs are public. It now listens on `127.0.0.1` only, behind kube-rbac-proxy on `:9100` (TLS + Prometheus' token), so anonymous requests get `401`.

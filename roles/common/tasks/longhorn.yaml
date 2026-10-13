@@ -1,0 +1,86 @@
+---
+# Node prerequisites for Longhorn (roles/longhorn): volumes are attached to the
+# node over iSCSI, RWX volumes and NFS backup targets are mounted with the NFSv4
+# client, and encrypted volumes need dm-crypt.
+- name: Install Longhorn node packages
+  ansible.builtin.apt:
+    name: "{{ longhorn_node_packages }}"
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+
+# nfs-common pulls in rpcbind, which listens on port 111 on every interface, and
+# the node IPs are public. The NFSv4 client Longhorn uses never needs it.
+- name: Keep rpcbind off (public port 111; NFSv4 does not use it)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop: [rpcbind.socket, rpcbind.service]
+
+- name: Load Longhorn kernel modules at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/longhorn.conf
+    content: |
+      {% for module in longhorn_kernel_modules %}
+      {{ module }}
+      {% endfor %}
+    mode: "0644"
+
+- name: Load Longhorn kernel modules now
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ longhorn_kernel_modules }}"
+
+- name: Enable and start iscsid
+  ansible.builtin.systemd:
+    name: iscsid
+    state: started
+    enabled: true
+
+# Ubuntu runs multipathd, which claims the iSCSI disks Longhorn attaches; the
+# volume then fails to mount ("already mounted or mount point busy"), and
+# Longhorn flags every node where multipathd runs (node condition Multipathd).
+# These nodes have one plain disk, so multipathd is turned off.
+- name: Check for multipathd
+  ansible.builtin.stat:
+    path: /usr/sbin/multipathd
+  register: longhorn_multipathd
+
+- name: Turn off multipathd
+  when: longhorn_multipathd.stat.exists
+  block:
+    - name: List multipath devices in use
+      ansible.builtin.command: dmsetup ls --target multipath
+      register: longhorn_multipath_maps
+      changed_when: false
+
+    - name: Refuse to turn off multipath that is in use
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} uses multipath devices ({{ longhorn_multipath_maps.stdout_lines | join(', ') }}).
+          Blacklist only the disks Longhorn attaches in /etc/multipath.conf instead
+          (https://longhorn.io/kb/troubleshooting-volume-with-multipath).
+      when: longhorn_multipath_maps.stdout is not search('No devices found')
+
+    # in case multipathd is ever turned back on
+    - name: Keep multipath away from Longhorn disks
+      ansible.builtin.blockinfile:
+        path: /etc/multipath.conf
+        create: true
+        mode: "0644"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK: Longhorn"
+        block: |
+          blacklist {
+              devnode "^sd[a-z0-9]+"
+          }
+
+    - name: Stop and disable multipathd
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop: [multipathd.socket, multipathd.service]

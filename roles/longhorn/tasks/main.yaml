@@ -1,0 +1,107 @@
+---
+- name: Install / upgrade Longhorn
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: longhorn
+    release_namespace: "{{ longhorn_namespace }}"
+    create_namespace: true
+    chart_repo_url: "{{ longhorn_chart_repo_url }}"
+    chart_ref: longhorn
+    chart_version: "{{ longhorn_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # return right away and poll the rollouts below (see roles/authentik)
+    wait: false
+
+- name: Wait for the Longhorn managers and UI
+  ansible.builtin.command: "{{ longhorn_kubectl }} rollout status {{ item }} --timeout=600s"
+  loop:
+    - daemonset/longhorn-manager
+    - deployment/longhorn-driver-deployer
+    - deployment/longhorn-ui
+  changed_when: false
+
+# longhorn-driver-deployer creates the CSI driver once the managers are up.
+- name: Wait for the Longhorn CSI driver
+  ansible.builtin.command: "{{ longhorn_kubectl }} rollout status {{ item }} --timeout=60s"
+  loop:
+    - daemonset/longhorn-csi-plugin
+    - deployment/csi-attacher
+    - deployment/csi-provisioner
+    - deployment/csi-resizer
+    - deployment/csi-snapshotter
+  register: longhorn_csi_rollout
+  until: longhorn_csi_rollout.rc == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+# Every node must pass Longhorn's own checks: packages and kernel modules from
+# roles/common, NFSv4 client, no multipathd, mount propagation. (Schedulable is
+# left out: it is False on a cordoned node, e.g. during maintenance.)
+- name: Wait until every node is a ready Longhorn node
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} get nodes.longhorn.io -o jsonpath='{range .items[*]}{.metadata.name}
+    {range .status.conditions[*]} {.type}={.status}{end}{"\n"}{end}'
+  register: longhorn_node_conditions
+  until: >-
+    longhorn_node_conditions.rc == 0
+    and longhorn_node_conditions.stdout_lines | length == groups['rke2_cluster'] | length
+    and longhorn_node_conditions.stdout_lines | select('search', longhorn_node_problem) | list | length == 0
+    and longhorn_node_conditions.stdout_lines | select('search', ' Ready=True') | list | length == groups['rke2_cluster'] | length
+  vars:
+    longhorn_node_problem: '(Ready|MountPropagation|Multipathd|KernelModulesLoaded|RequiredPackages|NFSClientInstalled)=False'
+  retries: 30
+  delay: 10
+  changed_when: false
+  failed_when: >-
+    longhorn_node_conditions.rc != 0
+    or longhorn_node_conditions.stdout_lines | length != groups['rke2_cluster'] | length
+    or longhorn_node_conditions.stdout_lines | select('search', longhorn_node_problem) | list | length > 0
+
+# Each node is tagged with its site (platform_node_sites); the replicated classes
+# only place copies on nodes tagged with the primary site. Tags other than site
+# names are left alone.
+- name: Read Longhorn node tags
+  ansible.builtin.command: "{{ longhorn_kubectl }} get nodes.longhorn.io {{ item.key }} -o jsonpath={.spec.tags}"
+  loop: "{{ platform_node_sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: longhorn_node_tags
+  changed_when: false
+
+- name: Tag Longhorn nodes with their site
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} patch nodes.longhorn.io {{ item.item.key }}
+    --type merge -p '{{ {"spec": {"tags": longhorn_wanted_tags}} | to_json }}'
+  vars:
+    longhorn_current_tags: "{{ (item.stdout | from_json) if item.stdout | length > 0 else [] }}"
+    longhorn_wanted_tags: >-
+      {{ (longhorn_current_tags | difference(platform_node_sites.values() | unique) + [item.item.value]) | unique | sort }}
+  loop: "{{ longhorn_node_tags.results }}"
+  loop_control:
+    label: "{{ item.item.key }}={{ item.item.value }}"
+  when: longhorn_current_tags | sort != longhorn_wanted_tags
+
+# Server-side diff/apply (see roles/monitoring tasks/apply.yaml). A changed
+# parameter is refused by Kubernetes: delete that StorageClass and re-run.
+- name: Check Longhorn StorageClasses and NetworkPolicies for drift
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', item) }}"
+  loop: [storageclasses.yaml.j2, networkpolicies.yaml.j2]
+  register: longhorn_objects_diff
+  changed_when: false
+  failed_when: longhorn_objects_diff.rc > 1
+
+- name: Apply Longhorn StorageClasses and NetworkPolicies
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', item.item) }}"
+  loop: "{{ longhorn_objects_diff.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc == 1
+
+- name: Verify Longhorn
+  ansible.builtin.import_tasks: verify.yaml

@@ -1,0 +1,51 @@
+# Copies one local-path volume into its new Longhorn volume (Managed by Ansible).
+# The pod lands on the node holding the local-path volume (its PV is pinned
+# there), so a local-class Longhorn volume gets its only copy on that same node.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ migration_job }}
+  namespace: {{ migration_namespace }}
+  labels: { app.kubernetes.io/name: local-path-migration }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ migration_copy_timeout }}
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: local-path-migration }
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # root, to read and keep every file's owner and mode
+      securityContext: { runAsUser: 0, runAsGroup: 0 }
+      containers:
+        - name: copy
+          image: {{ migration_copy_image }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # start from an empty volume: a re-run may find an earlier partial copy
+              find /to -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
+              cp -a /from/. /to/
+              chown --reference=/from /to
+              chmod --reference=/from /to
+              # same tree (type, mode, owner, link target) and same file contents
+              tree() { cd "$1" && find . -mindepth 1 -path ./lost+found -prune -o -printf '%y %m %U:%G %p %l\n' | LC_ALL=C sort; }
+              sums() { cd "$1" && find . -mindepth 1 -path ./lost+found -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum; }
+              if ! diff <(tree /from) <(tree /to) > /tmp/tree.diff; then echo "COPY_FAILED tree differs:"; head -20 /tmp/tree.diff; exit 1; fi
+              if ! diff <(sums /from) <(sums /to) > /tmp/sums.diff; then echo "COPY_FAILED contents differ:"; head -20 /tmp/sums.diff; exit 1; fi
+              [ "$(stat -c '%a %u:%g' /from)" = "$(stat -c '%a %u:%g' /to)" ] || { echo "COPY_FAILED top directory owner/mode differ"; exit 1; }
+              echo "COPY_OK files=$(sums /from | wc -l) bytes=$(du -sb --exclude=lost+found /to | cut -f1)"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: from, mountPath: /from, readOnly: true }
+            - { name: to, mountPath: /to }
+      volumes:
+        - name: from
+          persistentVolumeClaim: { claimName: {{ migration_claim }}, readOnly: true }
+        - name: to
+          persistentVolumeClaim: { claimName: {{ migration_tmp_claim }} }

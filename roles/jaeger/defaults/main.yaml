@@ -1,7 +1,7 @@
 ---
 # Defaults for jaeger role
 # Jaeger v2 (built on the OpenTelemetry Collector) as one pod: receives OTLP
-# from Alloy, stores spans in Badger on a node-local volume, serves the UI and
+# from Alloy, stores spans in Badger on a Longhorn volume, serves the UI and
 # the API (Grafana datasource), and turns spans into request/error/latency
 # metrics (span metrics) for the UI's Monitor tab and Grafana.
 # 2.21+ removed the v1 HTTP API (/api/services, /api/traces) that Grafana's
@@ -11,8 +11,8 @@ jaeger_image: "docker.io/jaegertracing/jaeger:2.20.0"
 
 # Badger is an embedded database: one writer, so exactly one replica.
 jaeger_span_ttl: "168h"                  # 7 days
-jaeger_storage_class: "local-path-retain"
-jaeger_storage_size: "20Gi"              # not enforced by local-path: watch the node's disk
+jaeger_storage_class: "longhorn-retain"  # two copies, one per primary-site node (roles/longhorn)
+jaeger_storage_size: "20Gi"
 jaeger_resources:
   requests: { cpu: 100m, memory: 256Mi }
   limits: { memory: 1Gi }

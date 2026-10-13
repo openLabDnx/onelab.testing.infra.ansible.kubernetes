@@ -70,13 +70,13 @@ spec:
           labels: { severity: critical }
           annotations:
             summary: Loki can't write chunks to its volume
-            description: Usually a full or read-only disk on the node that holds the loki PVC.
+            description: Usually a full or read-only loki volume; check it in the Longhorn UI.
         - alert: LokiWALDiskFull
           expr: increase(loki_ingester_wal_disk_full_failures_total{job="{{ loki_metrics_job }}"}[5m]) > 0
           labels: { severity: critical }
           annotations:
             summary: Loki's write-ahead log hit a full disk
-            description: Logs received now are lost if Loki restarts. Free space on the node that holds the loki PVC.
+            description: Logs received now are lost if Loki restarts. Free space on the loki volume (Longhorn UI), or grow loki_storage_size.
         - alert: LokiRetentionNotRunning
           expr: time() - max(loki_compactor_apply_retention_last_successful_run_timestamp_seconds{job="{{ loki_metrics_job }}"}) > 3 * 3600
           for: 1h

@@ -1,0 +1,54 @@
+---
+# Publishes the Longhorn UI at https://{{ longhorn_host }} behind authentik
+# forward-auth: the UI has no login of its own, and anyone in it can delete
+# volumes. Only Traefik may reach the UI pods (templates/networkpolicies.yaml.j2).
+# Needs authentik (playbooks/09-platform.yaml); until then nothing is published.
+- name: Check for authentik's forward-auth middleware
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ authentik_namespace }} get middlewares.traefik.io authentik-forward-auth
+    --ignore-not-found -o name
+  register: longhorn_authentik_middleware
+  changed_when: false
+
+- name: Note that the UI waits for authentik
+  ansible.builtin.debug:
+    msg: "authentik is not installed yet: `make platform` publishes the Longhorn UI at https://{{ longhorn_host }}/ once it is."
+  when: longhorn_authentik_middleware.stdout | length == 0
+
+- name: Publish the Longhorn UI behind authentik
+  when: longhorn_authentik_middleware.stdout | length > 0
+  block:
+    # The Longhorn forward-auth app comes from platform_forward_auth_apps.
+    - name: Publish and apply the platform blueprint
+      ansible.builtin.include_role:
+        name: authentik
+        tasks_from: blueprint.yaml
+
+    - name: Route the Longhorn UI through authentik
+      ansible.builtin.include_role:
+        name: traefik
+        tasks_from: protected_route.yaml
+      vars:
+        route_name: longhorn-ui
+        route_namespace: "{{ longhorn_namespace }}"
+        route_host: "{{ longhorn_host }}"
+        route_service: longhorn-frontend
+        route_port: 80
+
+    # Through Cloudflare; skip with --skip-tags public.
+    - name: The Longhorn UI asks for an authentik login
+      ansible.builtin.uri:
+        url: "https://{{ longhorn_host }}/"
+        follow_redirects: none
+        status_code: [302]
+      register: longhorn_ui_public
+      until: longhorn_ui_public.location | default('') is search('^https://' ~ authentik_host ~ '/')
+      retries: 12
+      delay: 10
+      delegate_to: localhost
+      become: false
+      tags: [public]
+
+    - name: Display Longhorn UI address
+      ansible.builtin.debug:
+        msg: "Longhorn UI: https://{{ longhorn_host }}/ (authentik, group {{ platform_admin_group }}; tile 'Longhorn' in authentik)"

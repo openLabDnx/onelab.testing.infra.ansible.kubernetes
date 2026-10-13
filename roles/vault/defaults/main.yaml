@@ -12,7 +12,8 @@ vault_version: "2.0.4"
 # One Raft voter per node (required pod anti-affinity) -> tolerates losing 1 of 3 nodes.
 vault_replicas: 3
 vault_data_size: "10Gi"
-vault_storage_class: "local-path-retain"
+# Longhorn, one copy on the pod's own node (roles/longhorn): Raft keeps the 3 copies.
+vault_storage_class: "longhorn-local-retain"
 
 vault_server_resources:
   requests:

@@ -15,7 +15,7 @@
   changed_when: false
   failed_when: false
 
-# Volumes use reclaimPolicy Retain; switch to Delete so local-path-provisioner wipes the data dirs.
+# Volumes use reclaimPolicy Retain; switch to Delete so Longhorn deletes the volumes and their replicas.
 - name: Switch Vault volumes to reclaimPolicy Delete
   ansible.builtin.command: >
     {{ cluster_kubectl }} patch pv {{ item }}

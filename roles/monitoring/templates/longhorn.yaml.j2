@@ -1,0 +1,82 @@
+# Longhorn metrics and alerts (Managed by Ansible). Longhorn is installed before
+# the Prometheus Operator's CRDs exist (05-storage), so they are added here.
+# One manager per node reports that node's volumes, replicas, disks and
+# instance managers; roles/longhorn lets Prometheus reach their port 9500.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: longhorn
+  namespace: {{ longhorn_namespace }}
+spec:
+  selector:
+    matchLabels: { app: longhorn-manager }
+  endpoints:
+    - { port: manager, interval: 30s, scrapeTimeout: 25s }
+---
+# Longhorn's example rules (longhorn.io/docs/1.12.1/monitoring/alert-rules-example)
+# plus a volume remounted read-only.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: longhorn
+  namespace: {{ longhorn_namespace }}
+spec:
+  groups:
+    - name: longhorn
+      rules:
+        - alert: LonghornVolumeStatusCritical
+          expr: longhorn_volume_robustness == 3
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Longhorn volume {{ '{{' }} $labels.pvc_namespace }}/{{ '{{' }} $labels.pvc }} is faulted"
+            description: No healthy copy is left; the app on it is down. See the volume in the Longhorn UI.
+        - alert: LonghornVolumeStatusWarning
+          expr: longhorn_volume_robustness == 2
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Longhorn volume {{ '{{' }} $labels.pvc_namespace }}/{{ '{{' }} $labels.pvc }} is degraded"
+            description: It lost a copy (usually its node is down) and runs on the others until the copy is rebuilt.
+        - alert: LonghornVolumeReadOnly
+          expr: longhorn_volume_file_system_read_only == 1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Longhorn volume {{ '{{' }} $labels.pvc_namespace }}/{{ '{{' }} $labels.pvc }} is mounted read-only"
+            description: The filesystem went read-only (often after a network interruption); restart the pod that uses it.
+        - alert: LonghornVolumeActualSpaceUsedWarning
+          expr: (longhorn_volume_actual_size_bytes / longhorn_volume_capacity_bytes) * 100 > 90
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Longhorn volume {{ '{{' }} $labels.pvc_namespace }}/{{ '{{' }} $labels.pvc }} uses {{ '{{' }} $value | humanize }}% of its size"
+            description: Data and snapshots fill the volume. Grow the claim, or remove old snapshots in the Longhorn UI.
+        - alert: LonghornNodeStorageWarning
+          expr: (longhorn_node_storage_usage_bytes / longhorn_node_storage_capacity_bytes) * 100 > 70
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Longhorn storage on {{ '{{' }} $labels.node }} is {{ '{{' }} $value | humanize }}% used"
+            description: Longhorn shares the node's root disk; volumes are thin, so their sizes add up to more than the disk.
+        - alert: LonghornDiskStorageWarning
+          expr: (longhorn_disk_usage_bytes / longhorn_disk_capacity_bytes) * 100 > 70
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Longhorn disk {{ '{{' }} $labels.disk }} on {{ '{{' }} $labels.node }} is {{ '{{' }} $value | humanize }}% used"
+            description: Longhorn stops placing new copies on a disk with less than 25% free.
+        - alert: LonghornNodeDown
+          expr: (avg(longhorn_node_count_total) or on() vector(0)) - (count(longhorn_node_status{condition="ready"} == 1) or on() vector(0)) > 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ '{{' }} $value }} Longhorn node(s) not ready"
+            description: Volumes with a copy there are degraded; single-copy volumes there are down until the node is back.
+        - alert: LonghornInstanceManagerCPUUsageWarning
+          expr: (longhorn_instance_manager_cpu_usage_millicpu / longhorn_instance_manager_cpu_requests_millicpu) * 100 > 300
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Longhorn instance manager {{ '{{' }} $labels.instance_manager }} uses {{ '{{' }} $value | humanize }}% of its CPU request"
+            description: Raise guaranteedInstanceManagerCPU (roles/longhorn longhorn_settings) or check the volumes' I/O.

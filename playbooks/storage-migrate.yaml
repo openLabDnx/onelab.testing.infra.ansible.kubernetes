@@ -1,0 +1,279 @@
+---
+# One-time move of the volumes still on local-path onto Longhorn (run
+# 05-storage first). App by app, each stopped for a few minutes: copy every
+# volume into a new Longhorn volume and compare them, put the claim (same name,
+# labels, owners) on it, start the app again, then run the app's role, which
+# checks it end to end. The local-path volumes stay (Retain) until
+# `make local-path-remove`. Re-runs skip moved claims and finish a run that
+# stopped half-way. One app: --tags observability|portainer|authentik|vault|apisix|rabbitmq|kafka
+- name: Plan the move to Longhorn
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [always]
+  vars_prompt:
+    - name: migration_confirm
+      prompt: "Each app is stopped for a few minutes while its volumes are copied to Longhorn. Type 'migrate' to continue"
+      private: no
+  tasks:
+    - name: Abort unless confirmed
+      ansible.builtin.fail:
+        msg: "Confirmation not given, nothing was changed."
+      when: migration_confirm != 'migrate'
+
+    # The class each claim moves to is the one its role uses from now on.
+    - name: Read the roles' settings
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/{{ item }}/defaults/main.yaml"
+        name: "{{ item }}_defaults"
+      loop: [platform_vars, local_path_migration, monitoring, loki, jaeger, portainer, authentik, vault, apisix, rabbitmq, kafka]
+
+    - name: Check that the Longhorn classes exist (make storage)
+      ansible.builtin.command: >-
+        {{ platform_vars_defaults.cluster_kubectl }} get storageclass
+        {{ ([monitoring_defaults.monitoring_storage_class, loki_defaults.loki_storage_class, jaeger_defaults.jaeger_storage_class,
+             portainer_defaults.portainer_storage_class, authentik_defaults.authentik_db_storage_class,
+             authentik_defaults.authentik_backup_storage_class, vault_defaults.vault_storage_class,
+             apisix_defaults.apisix_etcd_storage_class, rabbitmq_defaults.rabbitmq_storage_class,
+             kafka_defaults.kafka_storage_class] | unique | join(' ')) }} -o name
+      changed_when: false
+
+    - name: Keep the resume state on the server
+      ansible.builtin.file:
+        path: "{{ local_path_migration_defaults.migration_state_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: List the claims still on local-path
+      ansible.builtin.command: >-
+        {{ platform_vars_defaults.cluster_kubectl }} get pvc -A
+        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.storageClassName}{"\n"}{end}'
+      register: migration_plan
+      changed_when: false
+
+    - name: Display the plan
+      ansible.builtin.debug:
+        msg: "{{ migration_plan.stdout_lines | select('search', ' (' ~ (local_path_migration_defaults.migration_source_classes | join('|')) ~ ')$') | list or ['nothing left on local-path'] }}"
+
+- name: Observability (Grafana, Prometheus, Loki, Jaeger)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [observability]
+  tasks:
+    - name: Move Grafana
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.observability_namespace }}"
+        migration_class: "{{ monitoring_defaults.monitoring_storage_class }}"
+        migration_claim_pattern: "^kube-prometheus-stack-grafana$"
+        migration_workloads: [{ kind: deployment, name: kube-prometheus-stack-grafana }]
+
+    - name: Move Prometheus
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: prometheus.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.observability_namespace }}"
+        migration_class: "{{ monitoring_defaults.monitoring_storage_class }}"
+        migration_prometheus: kube-prometheus-stack-prometheus
+
+    - name: Move Loki
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.observability_namespace }}"
+        migration_class: "{{ loki_defaults.loki_storage_class }}"
+        migration_claim_pattern: "^storage-loki-[0-9]+$"
+        migration_workloads: [{ kind: statefulset, name: loki }]
+
+    - name: Move Jaeger
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.observability_namespace }}"
+        migration_class: "{{ jaeger_defaults.jaeger_storage_class }}"
+        migration_claim_pattern: "^data-jaeger-[0-9]+$"
+        migration_workloads: [{ kind: statefulset, name: jaeger }]
+
+    - name: Check Prometheus and Grafana
+      ansible.builtin.include_role:
+        name: monitoring
+
+    - name: Check Loki
+      ansible.builtin.include_role:
+        name: loki
+
+    - name: Check Jaeger
+      ansible.builtin.include_role:
+        name: jaeger
+
+- name: Portainer
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [portainer]
+  tasks:
+    - name: Move Portainer
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.portainer_namespace }}"
+        migration_class: "{{ portainer_defaults.portainer_storage_class }}"
+        migration_claim_pattern: "^portainer$"
+        migration_workloads: [{ kind: deployment, name: portainer }]
+
+    - name: Check Portainer
+      ansible.builtin.include_role:
+        name: portainer
+
+- name: authentik (PostgreSQL and its backups)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [authentik]
+  tasks:
+    # no backup may start while its volume moves
+    - name: Pause the database backups
+      ansible.builtin.command: >-
+        {{ platform_vars_defaults.cluster_kubectl }} -n {{ platform_vars_defaults.authentik_namespace }}
+        patch cronjob authentik-db-backup -p '{"spec":{"suspend":true}}'
+      changed_when: false
+
+    - name: Move the backups volume
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.authentik_namespace }}"
+        migration_class: "{{ authentik_defaults.authentik_backup_storage_class }}"
+        migration_claim_pattern: "^authentik-db-backups$"
+        migration_workloads: []
+
+    - name: Resume the database backups
+      ansible.builtin.command: >-
+        {{ platform_vars_defaults.cluster_kubectl }} -n {{ platform_vars_defaults.authentik_namespace }}
+        patch cronjob authentik-db-backup -p '{"spec":{"suspend":false}}'
+      changed_when: false
+
+    - name: Move PostgreSQL (SSO is down meanwhile)
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: postgres.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.authentik_namespace }}"
+        migration_class: "{{ authentik_defaults.authentik_db_storage_class }}"
+        migration_pg_cluster: "{{ authentik_defaults.authentik_db_cluster }}"
+
+    - name: Check authentik
+      ansible.builtin.include_role:
+        name: authentik
+
+- name: Vault
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: yes
+  tags: [vault]
+  tasks:
+    - name: Move Vault's Raft volumes
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ vault_defaults.vault_namespace }}"
+        migration_class: "{{ vault_defaults.vault_storage_class }}"
+        migration_claim_pattern: "^data-{{ vault_defaults.vault_release_name }}-[0-9]+$"
+        migration_workloads: [{ kind: statefulset, name: "{{ vault_defaults.vault_release_name }}" }]
+
+    # pods come back sealed: the role unseals them and checks the Raft voters
+    - name: Unseal and check Vault
+      ansible.builtin.include_role:
+        name: vault
+
+- name: APISIX (etcd)
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [apisix]
+  tasks:
+    # the gateway keeps serving its routes from memory while etcd is down
+    - name: Move etcd's volumes
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: app.yaml
+      vars:
+        migration_namespace: "{{ apisix_defaults.apisix_namespace }}"
+        migration_class: "{{ apisix_defaults.apisix_etcd_storage_class }}"
+        migration_claim_pattern: "^data-{{ apisix_defaults.apisix_release_name }}-etcd-[0-9]+$"
+        migration_workloads: [{ kind: statefulset, name: "{{ apisix_defaults.apisix_release_name }}-etcd" }]
+
+    - name: Check APISIX
+      ansible.builtin.include_role:
+        name: apisix
+
+- name: RabbitMQ
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [rabbitmq]
+  tasks:
+    - name: Move RabbitMQ's volumes
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: rabbitmq.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.rabbitmq_namespace }}"
+        migration_class: "{{ rabbitmq_defaults.rabbitmq_storage_class }}"
+        migration_rabbitmq: "{{ rabbitmq_defaults.rabbitmq_cluster_name }}"
+
+    - name: Check RabbitMQ
+      ansible.builtin.include_role:
+        name: rabbitmq
+
+- name: Kafka
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [kafka]
+  tasks:
+    - name: Move Kafka's volumes
+      ansible.builtin.include_role:
+        name: local_path_migration
+        tasks_from: kafka.yaml
+      vars:
+        migration_namespace: "{{ platform_vars_defaults.kafka_namespace }}"
+        migration_class: "{{ kafka_defaults.kafka_storage_class }}"
+        migration_kafka: "{{ kafka_defaults.kafka_cluster_name }}"
+        migration_kafka_pool: main
+
+    - name: Check Kafka
+      ansible.builtin.include_role:
+        name: kafka
+
+- name: What is left on local-path
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [always]
+  tasks:
+    - name: List the claims still on local-path
+      ansible.builtin.command: >-
+        {{ platform_vars_defaults.cluster_kubectl }} get pvc -A
+        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.storageClassName}{"\n"}{end}'
+      register: migration_left
+      changed_when: false
+
+    - name: Display the result
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Still on local-path: ' ~ (migration_left_claims | join(', ')), 'Run the remaining parts with --tags.']
+             if migration_left_claims | length > 0 else
+             ['Every claim is on Longhorn. The old local-path volumes are kept as a fallback;',
+              'once the apps are fine, `make local-path-remove` deletes local-path-provisioner.'] }}
+      vars:
+        migration_left_claims: "{{ migration_left.stdout_lines | select('search', ' (' ~ (local_path_migration_defaults.migration_source_classes | join('|')) ~ ')$') | list }}"

@@ -1,0 +1,75 @@
+---
+# Prometheus belongs to the Prometheus Operator: scale its Prometheus resource
+# to zero, move the claim, then set the new class and the replicas back. The
+# operator re-creates the StatefulSet itself when its claim template changes.
+# in: migration_namespace, migration_class, migration_prometheus (Prometheus resource name)
+- name: Prometheus | find claims still on local-path
+  ansible.builtin.include_tasks: pending.yaml
+  vars:
+    migration_claim_pattern: "^prometheus-{{ migration_prometheus }}-db-"
+
+- name: Prometheus | saved replica count of an earlier run
+  ansible.builtin.stat:
+    path: "{{ migration_state_dir }}/prometheus-{{ migration_namespace }}-{{ migration_prometheus }}.json"
+  register: migration_prometheus_saved
+
+- name: Prometheus | move its claim
+  when: migration_pending | length > 0 or migration_prometheus_saved.stat.exists
+  block:
+    - name: Prometheus | keep its replica count until it is back
+      ansible.builtin.shell: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} get prometheus {{ migration_prometheus }} -o json
+        > {{ migration_state_dir }}/prometheus-{{ migration_namespace }}-{{ migration_prometheus }}.json
+      args:
+        creates: "{{ migration_state_dir }}/prometheus-{{ migration_namespace }}-{{ migration_prometheus }}.json"
+
+    - name: Prometheus | read the saved spec
+      ansible.builtin.slurp:
+        src: "{{ migration_state_dir }}/prometheus-{{ migration_namespace }}-{{ migration_prometheus }}.json"
+      register: migration_prometheus_raw
+
+    - name: Prometheus | scale to zero
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} patch prometheus {{ migration_prometheus }}
+        --type merge -p '{"spec":{"replicas":0}}'
+      changed_when: true
+
+    - name: Prometheus | wait for its pod to stop
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} get pods
+        -l operator.prometheus.io/name={{ migration_prometheus }} -o name
+      register: migration_prometheus_pods
+      until: migration_prometheus_pods.stdout | length == 0
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: Prometheus | move the claim
+      ansible.builtin.include_tasks: claim.yaml
+      loop: "{{ migration_pending }}"
+      loop_control:
+        loop_var: migration_claim
+
+    - name: Prometheus | new class, replicas back
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} patch prometheus {{ migration_prometheus }}
+        --type merge -p '{{ {"spec": {"replicas": migration_replicas | int,
+                             "storage": {"volumeClaimTemplate": {"spec": {"storageClassName": migration_class}}}}} | to_json }}'
+      vars:
+        migration_replicas: "{{ (migration_prometheus_raw.content | b64decode | from_json).spec.replicas | default(1, true) }}"
+      changed_when: true
+
+    - name: Prometheus | wait until it runs on the new volume
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} get pods
+        -l operator.prometheus.io/name={{ migration_prometheus }} -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}'
+      register: migration_prometheus_pods
+      until: migration_prometheus_pods.stdout_lines | select('equalto', 'Running') | list | length > 0
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Prometheus | back, drop the saved spec
+      ansible.builtin.file:
+        path: "{{ migration_state_dir }}/prometheus-{{ migration_namespace }}-{{ migration_prometheus }}.json"
+        state: absent

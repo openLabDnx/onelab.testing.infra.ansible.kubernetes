@@ -1,0 +1,47 @@
+# Longhorn smoke test (Managed by Ansible, removed again by tasks/verify.yaml):
+# one local-class volume per node, so every node attaches a volume over iSCSI,
+# and one replicated volume on the primary site. Each pod writes and reads back.
+{% macro smoke_test(name, class, node) %}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ name }}
+  namespace: {{ longhorn_namespace }}
+  labels: { app.kubernetes.io/name: longhorn-smoke-test }
+spec:
+  storageClassName: {{ class }}
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ name }}
+  namespace: {{ longhorn_namespace }}
+  labels: { app.kubernetes.io/name: longhorn-smoke-test }
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  nodeSelector:
+    kubernetes.io/hostname: {{ node }}
+  containers:
+    - name: probe
+      image: {{ longhorn_test_image }}
+      command: ["/bin/sh", "-ec", 'echo ok > /data/probe; sync; test "$(cat /data/probe)" = ok']
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits: { memory: 64Mi }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: {{ name }} }
+---
+{% endmacro %}
+{% for node in groups['rke2_cluster'] %}
+{{ smoke_test('ansible-smoke-' ~ node, longhorn_local_class, node) }}
+{% endfor %}
+{{ smoke_test('ansible-smoke-replicated', longhorn_replicated_class, longhorn_primary_nodes | first) }}

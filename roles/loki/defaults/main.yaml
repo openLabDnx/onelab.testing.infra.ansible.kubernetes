@@ -2,7 +2,7 @@
 # Defaults for loki role
 # Grafana Loki stores the cluster's logs: pod logs, node journals, Kubernetes
 # events and OTLP logs, all shipped by roles/alloy. One process ("Monolithic")
-# with its chunks and index on a node-local volume, because there is no object
+# with its chunks and index on a Longhorn volume, because there is no object
 # storage here; that also means one replica (see README: Observability).
 loki_chart_repo_url: "https://grafana-community.github.io/helm-charts"   # moved from grafana/helm-charts
 loki_chart_version: "18.13.7"            # Loki 3.7.8
@@ -10,8 +10,8 @@ loki_chart_version: "18.13.7"            # Loki 3.7.8
 # Logs older than this are deleted by the compactor. ~0.5 GB/day of raw logs
 # today, stored compressed: 30 days take a few GB.
 loki_retention_period: "720h"            # 30 days
-loki_storage_class: "local-path-retain"
-loki_storage_size: "50Gi"                # not enforced by local-path: watch the node's disk
+loki_storage_class: "longhorn-retain"    # two copies, one per primary-site node (roles/longhorn)
+loki_storage_size: "50Gi"
 loki_resources:
   requests: { cpu: 250m, memory: 1Gi }
   limits: { memory: 2Gi }

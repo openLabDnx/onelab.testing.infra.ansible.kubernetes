@@ -1,0 +1,74 @@
+---
+# Kafka belongs to Strimzi, whose operator also re-creates deleted broker pods:
+# stop the operator, stop the brokers one by one, move the claims, set the new
+# class in the node pool, then start the operator again (it starts the brokers).
+# in: migration_namespace, migration_class, migration_kafka (Kafka name),
+#     migration_kafka_pool (KafkaNodePool name)
+- name: Kafka | find claims still on local-path
+  ansible.builtin.include_tasks: pending.yaml
+  vars:
+    migration_claim_pattern: "^data-[0-9]+-{{ migration_kafka }}-{{ migration_kafka_pool }}-[0-9]+$"
+
+- name: Kafka | is the operator stopped (earlier run)
+  ansible.builtin.stat:
+    path: "{{ migration_state_dir }}/deployment-{{ migration_namespace }}-strimzi-cluster-operator.json"
+  register: migration_strimzi_stopped
+
+- name: Kafka | move its claims
+  when: migration_pending | length > 0 or migration_strimzi_stopped.stat.exists
+  block:
+    - name: Kafka | stop the Strimzi operator
+      ansible.builtin.include_tasks: workload_stop.yaml
+      vars:
+        migration_workload: { kind: deployment, name: strimzi-cluster-operator }
+
+    - name: Kafka | list the brokers
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} get pods
+        -l strimzi.io/cluster={{ migration_kafka }},strimzi.io/pool-name={{ migration_kafka_pool }}
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+      register: migration_kafka_pods
+      changed_when: false
+
+    # one at a time: each broker shuts down cleanly while the others still have a quorum
+    - name: Kafka | stop the brokers
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} delete pod {{ item }}
+        --ignore-not-found --wait=true --timeout=300s
+      loop: "{{ migration_kafka_pods.stdout_lines | sort | reverse | list }}"
+      changed_when: true
+
+    - name: Kafka | move the claims
+      ansible.builtin.include_tasks: claim.yaml
+      loop: "{{ migration_pending }}"
+      loop_control:
+        loop_var: migration_claim
+
+    - name: Kafka | read the node pool's volumes
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} get kafkanodepool {{ migration_kafka_pool }}
+        -o jsonpath={.spec.storage.volumes}
+      register: migration_kafka_volumes
+      changed_when: false
+
+    # the operator is stopped, so it never sees the claims and the pool disagree
+    - name: Kafka | new class in the node pool
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} patch kafkanodepool {{ migration_kafka_pool }}
+        --type merge -p '{{ {"spec": {"storage": {"volumes": migration_new_volumes}}} | to_json }}'
+      vars:
+        migration_new_volumes: >-
+          {{ migration_kafka_volumes.stdout | from_json
+             | map('combine', {'class': migration_class}) | list }}
+      changed_when: true
+
+    - name: Kafka | start the Strimzi operator (it starts the brokers)
+      ansible.builtin.include_tasks: workload_start.yaml
+      vars:
+        migration_workload: { kind: deployment, name: strimzi-cluster-operator }
+
+    - name: Kafka | wait for the cluster
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} wait kafka/{{ migration_kafka }}
+        --for=condition=Ready --timeout=1200s
+      changed_when: false

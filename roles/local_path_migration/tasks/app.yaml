@@ -1,0 +1,48 @@
+---
+# Moves the claims of an app run by plain StatefulSets/Deployments: stop them,
+# move each claim, start them again (StatefulSets re-created with the new class).
+# Also finishes an earlier run that stopped half-way (saved specs left behind).
+# in: migration_namespace, migration_claim_pattern, migration_class,
+#     migration_workloads: [{kind: statefulset|deployment, name}]
+- name: "{{ migration_namespace }} | find claims still on local-path"
+  ansible.builtin.include_tasks: pending.yaml
+
+- name: "{{ migration_namespace }} | find workloads an earlier run left stopped"
+  ansible.builtin.stat:
+    path: "{{ migration_state_dir }}/{{ item.kind }}-{{ migration_namespace }}-{{ item.name }}.json"
+  loop: "{{ migration_workloads }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.name }}"
+  register: migration_stopped
+
+- name: "{{ migration_namespace }} | nothing to move for {{ migration_workloads | map(attribute='name') | join(', ') }}"
+  ansible.builtin.debug:
+    msg: "No claim matching {{ migration_claim_pattern }} is on local-path."
+  when:
+    - migration_pending | length == 0
+    - migration_stopped.results | selectattr('stat.exists') | list | length == 0
+
+- name: "{{ migration_namespace }} | move {{ migration_pending | join(', ') }}"
+  when: >-
+    migration_pending | length > 0
+    or migration_stopped.results | selectattr('stat.exists') | list | length > 0
+  block:
+    - name: "{{ migration_namespace }} | stop"
+      ansible.builtin.include_tasks: workload_stop.yaml
+      loop: "{{ migration_workloads }}"
+      loop_control:
+        loop_var: migration_workload
+        label: "{{ migration_workload.kind }}/{{ migration_workload.name }}"
+
+    - name: "{{ migration_namespace }} | move the claims"
+      ansible.builtin.include_tasks: claim.yaml
+      loop: "{{ migration_pending }}"
+      loop_control:
+        loop_var: migration_claim
+
+    - name: "{{ migration_namespace }} | start"
+      ansible.builtin.include_tasks: workload_start.yaml
+      loop: "{{ migration_workloads }}"
+      loop_control:
+        loop_var: migration_workload
+        label: "{{ migration_workload.kind }}/{{ migration_workload.name }}"

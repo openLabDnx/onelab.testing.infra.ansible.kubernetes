@@ -1,0 +1,28 @@
+---
+# Sets migration_pending: the claims matching migration_claim_pattern in
+# migration_namespace that are still on local-path, or half-moved by an earlier
+# run (state file left on the server).
+# in: migration_namespace, migration_claim_pattern
+- name: "{{ migration_namespace }} | list claims and their classes"
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} get pvc
+    -o jsonpath='{range .items[*]}{.metadata.name}={.spec.storageClassName}{"\n"}{end}'
+  register: migration_claim_classes
+  changed_when: false
+
+- name: "{{ migration_namespace }} | find claims an earlier run left half-moved"
+  ansible.builtin.find:
+    paths: "{{ migration_state_dir }}"
+    patterns: "claim-{{ migration_namespace }}-*.json"
+  register: migration_half_moved
+
+- name: "{{ migration_namespace }} | claims to move"
+  ansible.builtin.set_fact:
+    migration_pending: >-
+      {{ (migration_claim_classes.stdout_lines
+            | select('search', '=(' ~ (migration_source_classes | map('regex_escape') | join('|')) ~ ')$')
+            | map('regex_replace', '=.*$', '') | list
+          + migration_half_moved.files | map(attribute='path') | map('basename')
+            | map('regex_replace', '^claim-' ~ (migration_namespace | regex_escape) ~ '-', '')
+            | map('regex_replace', '[.]json$', '') | list)
+         | select('match', migration_claim_pattern) | unique | sort }}

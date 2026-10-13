@@ -1,0 +1,268 @@
+---
+# Moves one claim from local-path onto Longhorn under the same name. Whatever
+# uses the claim must be stopped. Steps: copy the data into a new Longhorn
+# volume (through a temporary claim), save the old claim and both volume names
+# in a state file, delete the old claim (its local-path volume is kept, Retain),
+# re-create the claim with the same labels/annotations/owners on the new volume.
+# A failed run resumes from the state file.
+# in: migration_namespace, migration_claim, migration_class
+- name: "{{ migration_claim }} | names"
+  ansible.builtin.set_fact:
+    migration_ns_kubectl: "{{ cluster_kubectl }} -n {{ migration_namespace }}"
+    migration_state_file: "{{ migration_state_dir }}/claim-{{ migration_namespace }}-{{ migration_claim }}.json"
+    migration_tmp_claim: "{{ migration_claim }}-longhorn"
+    migration_job: "lh-copy-{{ ((migration_namespace ~ '/' ~ migration_claim) | hash('sha1'))[:10] }}"
+
+- name: "{{ migration_claim }} | read the claim"
+  ansible.builtin.command: "{{ migration_ns_kubectl }} get pvc {{ migration_claim }} --ignore-not-found -o json"
+  register: migration_claim_raw
+  changed_when: false
+
+- name: "{{ migration_claim }} | read the state of an earlier run"
+  ansible.builtin.slurp:
+    src: "{{ migration_state_file }}"
+  register: migration_state_raw
+  failed_when: false
+
+- name: "{{ migration_claim }} | what to do"
+  ansible.builtin.set_fact:
+    migration_current: "{{ (migration_claim_raw.stdout | from_json) if migration_claim_raw.stdout | length > 0 else {} }}"
+    migration_state: "{{ (migration_state_raw.content | b64decode | from_json) if migration_state_raw.content is defined else {} }}"
+
+- name: "{{ migration_claim }} | already on {{ migration_class }}"
+  ansible.builtin.debug:
+    msg: "{{ migration_namespace }}/{{ migration_claim }} is on {{ migration_class }} already"
+  when:
+    - migration_state | length == 0
+    - (migration_current.spec.storageClassName | default('')) == migration_class
+
+- name: "{{ migration_claim }} | refuse an unknown claim"
+  ansible.builtin.fail:
+    msg: >-
+      {{ migration_namespace }}/{{ migration_claim }}
+      {{ ('has class ' ~ migration_current.spec.storageClassName) if migration_current | length > 0 else 'does not exist' }}:
+      expected one of {{ migration_source_classes }} (or {{ migration_class }} when already moved).
+  when:
+    - migration_state | length == 0
+    - (migration_current.spec.storageClassName | default('')) != migration_class
+    - (migration_current.spec.storageClassName | default('')) not in migration_source_classes
+
+# --- copy (only while no state file exists) ---------------------------------------
+- name: "{{ migration_claim }} | copy into a new Longhorn volume"
+  when:
+    - migration_state | length == 0
+    - (migration_current.spec.storageClassName | default('')) in migration_source_classes
+  block:
+    - name: "{{ migration_claim }} | the claim is bound"
+      ansible.builtin.assert:
+        that:
+          - migration_current.status.phase == 'Bound'
+          - migration_current.spec.volumeName | default('') | length > 0
+        fail_msg: "{{ migration_namespace }}/{{ migration_claim }} is {{ migration_current.status.phase }}"
+        quiet: true
+
+    - name: "{{ migration_claim }} | remove a copy job left by an earlier run"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} delete job {{ migration_job }} --ignore-not-found --cascade=foreground --wait=true --timeout=120s"
+      changed_when: false
+
+    - name: "{{ migration_claim }} | check that nothing uses it"
+      ansible.builtin.include_tasks: claim_unused.yaml
+
+    - name: "{{ migration_claim }} | temporary claim on {{ migration_class }}"
+      ansible.builtin.command:
+        cmd: "{{ cluster_kubectl }} apply -f -"
+        stdin: "{{ migration_tmp_manifest | to_json }}"
+      vars:
+        migration_tmp_manifest:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ migration_tmp_claim }}"
+            namespace: "{{ migration_namespace }}"
+            labels: { app.kubernetes.io/name: local-path-migration }
+          spec:
+            storageClassName: "{{ migration_class }}"
+            accessModes: "{{ migration_current.spec.accessModes }}"
+            volumeMode: "{{ migration_current.spec.volumeMode | default('Filesystem') }}"
+            resources:
+              requests:
+                storage: "{{ migration_current.spec.resources.requests.storage }}"
+      changed_when: true
+
+    - name: "{{ migration_claim }} | start the copy job"
+      ansible.builtin.command:
+        cmd: "{{ cluster_kubectl }} create -f -"
+        stdin: "{{ lookup('ansible.builtin.template', 'copy-job.yaml.j2') }}"
+      changed_when: true
+
+    - name: "{{ migration_claim }} | wait for the copy"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} get job {{ migration_job }} -o jsonpath={.status.succeeded}:{.status.failed}"
+      register: migration_job_status
+      until: migration_job_status.stdout is search('^1:') or migration_job_status.stdout is search(':[1-9]')
+      retries: "{{ (migration_copy_timeout | int / 10) | int + 6 }}"
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ migration_claim }} | read the copy job's report"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} logs job/{{ migration_job }} --tail=40"
+      register: migration_job_log
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ migration_claim }} | the copy is complete and identical"
+      ansible.builtin.assert:
+        that:
+          - migration_job_status.stdout is search('^1:')
+          - migration_job_log.stdout is search('COPY_OK')
+        fail_msg: >-
+          Copying {{ migration_namespace }}/{{ migration_claim }} failed; the claim is unchanged.
+          {{ migration_job_log.stdout_lines | default([]) }}
+          (kubectl -n {{ migration_namespace }} describe job {{ migration_job }})
+        success_msg: "{{ migration_job_log.stdout_lines | select('search', 'COPY_OK') | first | default('') }}"
+
+    - name: "{{ migration_claim }} | remove the copy job (detaches the volumes)"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} delete job {{ migration_job }} --cascade=foreground --wait=true --timeout=180s"
+      changed_when: false
+
+    - name: "{{ migration_claim }} | read the new volume"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} get pvc {{ migration_tmp_claim }} -o jsonpath={.spec.volumeName}"
+      register: migration_new_volume
+      changed_when: false
+      failed_when: migration_new_volume.stdout | length == 0
+
+    - name: "{{ migration_claim }} | read the class's data locality"
+      ansible.builtin.command: "{{ cluster_kubectl }} get storageclass {{ migration_class }} -o jsonpath={.parameters.dataLocality}"
+      register: migration_locality
+      changed_when: false
+
+    # A one-copy (strict-local) volume can only attach where its copy is: the
+    # copy job put it on the old volume's node, and Longhorn pins the volume
+    # there, so the app's pod lands on that node again (like with local-path).
+    - name: "{{ migration_claim }} | read the nodes of the old and the new volume"
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} get pv {{ item }}
+        -o jsonpath={.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}
+      loop:
+        - "{{ migration_current.spec.volumeName }}"
+        - "{{ migration_new_volume.stdout }}"
+      register: migration_pinned
+      until: migration_pinned.stdout | length > 0
+      retries: 24
+      delay: 5
+      changed_when: false
+      when: migration_locality.stdout == 'strict-local'
+
+    - name: "{{ migration_claim }} | the new volume is pinned to the old volume's node"
+      ansible.builtin.assert:
+        that: migration_pinned.results[0].stdout == migration_pinned.results[1].stdout
+        fail_msg: >-
+          The new volume {{ migration_new_volume.stdout }} is pinned to '{{ migration_pinned.results[1].stdout }}',
+          not to '{{ migration_pinned.results[0].stdout }}' like the old one; the claim is unchanged.
+        quiet: true
+      when: migration_locality.stdout == 'strict-local'
+
+    - name: "{{ migration_claim }} | save the state (resume point)"
+      ansible.builtin.copy:
+        content: "{{ {'claim': migration_current, 'old_volume': migration_current.spec.volumeName, 'new_volume': migration_new_volume.stdout} | to_nice_json }}\n"
+        dest: "{{ migration_state_file }}"
+        mode: "0600"
+
+    - name: "{{ migration_claim }} | continue from the state"
+      ansible.builtin.set_fact:
+        migration_state:
+          claim: "{{ migration_current }}"
+          old_volume: "{{ migration_current.spec.volumeName }}"
+          new_volume: "{{ migration_new_volume.stdout }}"
+
+# --- swap the claim onto the new volume (also resumes an earlier run) -------------
+- name: "{{ migration_claim }} | put the claim on its Longhorn volume"
+  when: migration_state | length > 0
+  block:
+    - name: "{{ migration_claim }} | check that nothing uses the old claim"
+      ansible.builtin.include_tasks: claim_unused.yaml
+      when: (migration_current.spec.volumeName | default('')) == migration_state.old_volume
+
+    # its local-path volume stays (Retain) with the data, as a fallback
+    - name: "{{ migration_claim }} | delete the old claim"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} delete pvc {{ migration_claim }} --wait=true --timeout=120s"
+      when: (migration_current.spec.volumeName | default('')) == migration_state.old_volume
+      changed_when: true
+
+    - name: "{{ migration_claim }} | delete the temporary claim (the new volume stays, Retain)"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} delete pvc {{ migration_tmp_claim }} --ignore-not-found --wait=true --timeout=120s"
+      changed_when: false
+
+    - name: "{{ migration_claim }} | read the new volume's binding"
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} get pv {{ migration_state.new_volume }}
+        -o jsonpath={.status.phase}/{.spec.claimRef.namespace}/{.spec.claimRef.name}
+      register: migration_new_binding
+      changed_when: false
+
+    - name: "{{ migration_claim }} | reserve the new volume for the claim"
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} patch pv {{ migration_state.new_volume }} --type merge
+        -p '{{ {"spec": {"claimRef": {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "namespace": migration_namespace, "name": migration_claim, "uid": none, "resourceVersion": none}}} | to_json }}'
+      when: migration_new_binding.stdout != 'Bound/' ~ migration_namespace ~ '/' ~ migration_claim
+      changed_when: true
+
+    - name: "{{ migration_claim }} | does the claim exist"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} get pvc {{ migration_claim }} --ignore-not-found -o name"
+      register: migration_claim_exists
+      changed_when: false
+
+    # Owners are kept (CloudNativePG's Cluster, Helm's annotations, Strimzi's
+    # labels); a StatefulSet adds its own owner reference back by itself.
+    - name: "{{ migration_claim }} | re-create the claim on the new volume"
+      ansible.builtin.command:
+        cmd: "{{ cluster_kubectl }} create -f -"
+        stdin: "{{ migration_new_claim | to_json }}"
+      vars:
+        migration_old: "{{ migration_state.claim }}"
+        migration_new_claim:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ migration_claim }}"
+            namespace: "{{ migration_namespace }}"
+            labels: "{{ migration_old.metadata.labels | default({}, true) }}"
+            annotations: >-
+              {{ migration_old.metadata.annotations | default({}, true) | dict2items
+                 | rejectattr('key', 'in', migration_dropped_annotations) | items2dict }}
+            ownerReferences: >-
+              {{ migration_old.metadata.ownerReferences | default([], true)
+                 | rejectattr('kind', 'equalto', 'StatefulSet') | list }}
+          spec:
+            accessModes: "{{ migration_old.spec.accessModes }}"
+            volumeMode: "{{ migration_old.spec.volumeMode | default('Filesystem') }}"
+            resources:
+              requests:
+                storage: "{{ migration_old.spec.resources.requests.storage }}"
+            storageClassName: "{{ migration_class }}"
+            volumeName: "{{ migration_state.new_volume }}"
+      when: migration_claim_exists.stdout | length == 0
+      changed_when: true
+
+    - name: "{{ migration_claim }} | wait until it is bound to the new volume"
+      ansible.builtin.command: "{{ migration_ns_kubectl }} get pvc {{ migration_claim }} -o jsonpath={.status.phase}/{.spec.volumeName}"
+      register: migration_bound
+      until: migration_bound.stdout == 'Bound/' ~ migration_state.new_volume
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    - name: "{{ migration_claim }} | mark the old local-path volume as migrated"
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} label pv {{ migration_state.old_volume }}
+        {{ migration_migrated_label }}={{ migration_state.new_volume }} --overwrite
+      changed_when: true
+
+    - name: "{{ migration_claim }} | done, drop the state"
+      ansible.builtin.file:
+        path: "{{ migration_state_file }}"
+        state: absent
+
+    - name: "{{ migration_claim }} | moved"
+      ansible.builtin.debug:
+        msg: "{{ migration_namespace }}/{{ migration_claim }}: {{ migration_state.old_volume }} (local-path, kept) -> {{ migration_state.new_volume }} ({{ migration_class }})"

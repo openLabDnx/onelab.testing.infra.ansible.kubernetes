@@ -27,3 +27,13 @@ required_sysctl_params:
   vm.max_map_count: 262144
   fs.inotify.max_user_instances: 8192
   fs.inotify.max_user_watches: 524288
+
+# Longhorn node prerequisites (tasks/longhorn.yaml)
+longhorn_node_packages:
+  - open-iscsi        # volumes are attached to the node over iSCSI
+  - nfs-common        # NFSv4 client: RWX volumes, NFS backup targets
+  - cryptsetup        # encrypted volumes
+  - dmsetup
+longhorn_kernel_modules:
+  - iscsi_tcp
+  - dm_crypt

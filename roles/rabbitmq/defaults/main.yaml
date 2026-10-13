@@ -7,7 +7,8 @@ rabbitmq_operator_manifest_url: "https://github.com/rabbitmq/cluster-operator/re
 rabbitmq_cluster_name: "rabbitmq"
 rabbitmq_replicas: 3
 rabbitmq_image: "rabbitmq:4.3.5-management"        # same version as the master cluster
-rabbitmq_storage_class: "local-path-retain"
+# Longhorn, one copy on the node's own disk (roles/longhorn): quorum queues keep the 3 copies.
+rabbitmq_storage_class: "longhorn-local-retain"
 rabbitmq_storage_size: "10Gi"
 rabbitmq_cpu_request: "250m"
 rabbitmq_memory: "1Gi"                             # request = limit; the operator sizes the memory alarm from it

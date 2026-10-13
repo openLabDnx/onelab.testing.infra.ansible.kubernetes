@@ -10,7 +10,8 @@ kafka_cluster_name: "kafka"
 # One combined broker+controller per server: survives losing any server with no
 # acknowledged data lost (RF 3, min.insync.replicas 2, producers with acks=all).
 kafka_replicas: 3
-kafka_storage_class: "local-path-retain"
+# Longhorn, one copy on the broker's own node (roles/longhorn): Kafka keeps the 3 copies.
+kafka_storage_class: "longhorn-local-retain"
 kafka_storage_size: "20Gi"
 kafka_heap: "1g"
 kafka_resources:

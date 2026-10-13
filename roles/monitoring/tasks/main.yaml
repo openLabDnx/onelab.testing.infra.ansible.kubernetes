@@ -78,6 +78,12 @@
     ssa_label: PodMonitors / ServiceMonitor
     ssa_manifest: "{{ lookup('ansible.builtin.template', 'monitors.yaml.j2') }}"
 
+- name: Longhorn scrape config and alerts
+  ansible.builtin.include_tasks: apply.yaml
+  vars:
+    ssa_label: Longhorn ServiceMonitor / PrometheusRule
+    ssa_manifest: "{{ lookup('ansible.builtin.template', 'longhorn.yaml.j2') }}"
+
 - name: Strimzi alert and recording rules
   ansible.builtin.include_tasks: apply.yaml
   vars:

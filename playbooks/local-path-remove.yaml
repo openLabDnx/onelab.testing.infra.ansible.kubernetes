@@ -1,0 +1,132 @@
+---
+# Removes local-path-provisioner once every claim is on Longhorn (make
+# storage-migrate). Deletes the old volumes that storage-migrate copied (label
+# autofik.com/migrated-to-longhorn); their data under /opt/local-path-provisioner
+# stays on the nodes unless -e local_path_purge_data=true. Directories that
+# belong to no migrated volume are never touched.
+- name: Remove local-path-provisioner
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  vars_prompt:
+    - name: local_path_remove_confirm
+      prompt: "This deletes local-path-provisioner and the local-path volumes already copied to Longhorn. Type 'remove-local-path' to continue"
+      private: no
+  vars:
+    local_path_classes: [local-path, local-path-retain]
+    local_path_root: /opt/local-path-provisioner
+    local_path_purge_data: false
+    local_path_migrated_label: autofik.com/migrated-to-longhorn
+    local_path_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"
+  tasks:
+    - name: Abort unless confirmed
+      ansible.builtin.fail:
+        msg: "Confirmation not given, nothing was changed."
+      when: local_path_remove_confirm != 'remove-local-path'
+
+    - name: Read the claims and volumes
+      ansible.builtin.command: "{{ local_path_kubectl }} get {{ item }} -o json"
+      loop: [pvc --all-namespaces, pv]
+      register: local_path_objects
+      changed_when: false
+
+    - name: Find what still uses local-path
+      ansible.builtin.set_fact:
+        local_path_claims: >-
+          {{ (local_path_objects.results[0].stdout | from_json)['items']
+             | selectattr('spec.storageClassName', 'defined')
+             | selectattr('spec.storageClassName', 'in', local_path_classes) | list }}
+        local_path_volumes: >-
+          {{ (local_path_objects.results[1].stdout | from_json)['items']
+             | selectattr('spec.storageClassName', 'defined')
+             | selectattr('spec.storageClassName', 'in', local_path_classes) | list }}
+
+    - name: Refuse while a claim is still on local-path
+      ansible.builtin.fail:
+        msg: >-
+          Still on local-path: {{ local_path_claims | map(attribute='metadata') | map(attribute='namespace') | zip(local_path_claims | map(attribute='metadata') | map(attribute='name')) | map('join', '/') | list }}.
+          Move them first: make storage-migrate.
+      when: local_path_claims | length > 0
+
+    - name: Split the old volumes into migrated and others
+      ansible.builtin.set_fact:
+        local_path_migrated: "{{ local_path_volumes | selectattr('metadata.labels', 'defined') | selectattr('metadata.labels', 'contains', local_path_migrated_label) | list }}"
+        local_path_unknown: "{{ local_path_volumes | rejectattr('metadata.labels', 'defined') | list + (local_path_volumes | selectattr('metadata.labels', 'defined') | rejectattr('metadata.labels', 'contains', local_path_migrated_label) | list) }}"
+
+    - name: Note where the migrated volumes keep their old data
+      ansible.builtin.set_fact:
+        local_path_dirs: >-
+          {{ local_path_dirs | default([]) + [{
+               'node': item.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0]['values'][0],
+               'path': item.spec.hostPath.path | default(item.spec['local'].path | default(''))}] }}
+      loop: "{{ local_path_migrated }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    # Their data is on Longhorn already; the PV objects only point at node directories.
+    - name: Delete the migrated local-path volumes
+      ansible.builtin.command: "{{ local_path_kubectl }} delete pv {{ local_path_migrated | map(attribute='metadata.name') | join(' ') }} --wait=true"
+      when: local_path_migrated | length > 0
+      changed_when: true
+
+    - name: Delete the old data of the migrated volumes on their nodes
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ local_path_dirs | default([]) }}"
+      loop_control:
+        label: "{{ item.node }}:{{ item.path }}"
+      delegate_to: "{{ item.node }}"
+      when:
+        - local_path_purge_data | bool
+        - item.path is match('^' ~ local_path_root ~ '/pvc-')
+
+    - name: Delete the local-path StorageClasses
+      ansible.builtin.command: "{{ local_path_kubectl }} delete storageclass {{ local_path_classes | join(' ') }} --ignore-not-found"
+      register: local_path_sc_delete
+      changed_when: local_path_sc_delete.stdout is search('deleted')
+
+    - name: Delete local-path-provisioner
+      ansible.builtin.command: "{{ local_path_kubectl }} delete {{ item }} --ignore-not-found --wait=true"
+      loop:
+        - clusterrolebinding local-path-provisioner-bind
+        - clusterrole local-path-provisioner-role
+        - namespace local-path-storage
+      register: local_path_delete
+      changed_when: local_path_delete.stdout is search('deleted')
+
+    - name: Find the downloaded local-path manifests
+      ansible.builtin.find:
+        paths: /opt/autofik/manifests
+        patterns: "local-path-storage-*.yaml"
+      register: local_path_manifests
+
+    - name: Delete the downloaded local-path manifests
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ local_path_manifests.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Display the result
+      ansible.builtin.debug:
+        msg:
+          - "local-path-provisioner and its StorageClasses are gone; {{ local_path_migrated | length }} migrated volume(s) deleted."
+          - "{{ ('Their data was deleted from the nodes.') if local_path_purge_data | bool else ('Their data is still on the nodes under ' ~ local_path_root ~ ' (fallback); delete it with -e local_path_purge_data=true or by hand.') }}"
+          - "{{ ('Kept, not migrated by storage-migrate: ' ~ (local_path_unknown | map(attribute='metadata.name') | join(', '))) if local_path_unknown | length > 0 else 'No other local-path volume objects.' }}"
+
+- name: Show what is left in the local-path directories
+  hosts: rke2_cluster
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: List the local-path directories
+      ansible.builtin.find:
+        paths: /opt/local-path-provisioner
+        file_type: directory
+      register: local_path_left
+
+    - name: Display them (not removed by this playbook)
+      ansible.builtin.debug:
+        msg: "{{ local_path_left.files | map(attribute='path') | sort | list or 'none' }}"

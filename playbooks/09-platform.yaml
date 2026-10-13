@@ -48,6 +48,18 @@
         name: traefik
         tasks_from: dashboard.yaml
 
+# Longhorn (05-storage) is installed before authentik, whose database it stores.
+- name: Longhorn UI behind authentik
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [longhorn, authentik]
+  tasks:
+    - name: Publish the Longhorn UI
+      ansible.builtin.include_role:
+        name: longhorn
+        tasks_from: ui.yaml
+
 - name: Argo CD (GitOps)
   hosts: "{{ groups['rke2_servers'][0] }}"
   become: yes

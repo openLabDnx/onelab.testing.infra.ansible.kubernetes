@@ -1,0 +1,59 @@
+---
+# A CloudNativePG cluster: hibernate it (the operator stops every instance and
+# keeps the claims), move the claims, set the new class, wake it up. The
+# instances start on their new volumes, primary and standby as before.
+# in: migration_namespace, migration_class, migration_pg_cluster (Cluster name)
+- name: PostgreSQL | find claims still on local-path
+  ansible.builtin.include_tasks: pending.yaml
+  vars:
+    migration_claim_pattern: "^{{ migration_pg_cluster }}-[0-9]+$"
+
+- name: PostgreSQL | is the cluster hibernated (earlier run)
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} get cluster.postgresql.cnpg.io {{ migration_pg_cluster }}
+    -o 'jsonpath={.metadata.annotations.cnpg\.io/hibernation}'
+  register: migration_pg_hibernation
+  changed_when: false
+
+- name: PostgreSQL | move its claims
+  when: migration_pending | length > 0 or migration_pg_hibernation.stdout == 'on'
+  block:
+    - name: PostgreSQL | hibernate the cluster
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} annotate cluster.postgresql.cnpg.io {{ migration_pg_cluster }}
+        cnpg.io/hibernation=on --overwrite
+      changed_when: true
+
+    - name: PostgreSQL | wait until every instance is stopped
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} get cluster.postgresql.cnpg.io {{ migration_pg_cluster }}
+        -o 'jsonpath={.status.conditions[?(@.type=="cnpg.io/hibernation")].reason}'
+      register: migration_pg_state
+      until: migration_pg_state.stdout == 'Hibernated'
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: PostgreSQL | move the claims
+      ansible.builtin.include_tasks: claim.yaml
+      loop: "{{ migration_pending }}"
+      loop_control:
+        loop_var: migration_claim
+
+    - name: PostgreSQL | new class in the cluster spec
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} patch cluster.postgresql.cnpg.io {{ migration_pg_cluster }}
+        --type merge -p '{{ {"spec": {"storage": {"storageClass": migration_class}}} | to_json }}'
+      changed_when: true
+
+    - name: PostgreSQL | wake the cluster up
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} annotate cluster.postgresql.cnpg.io {{ migration_pg_cluster }}
+        cnpg.io/hibernation=off --overwrite
+      changed_when: true
+
+    - name: PostgreSQL | wait for the cluster
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} wait cluster.postgresql.cnpg.io/{{ migration_pg_cluster }}
+        --for=condition=Ready --timeout=900s
+      changed_when: false

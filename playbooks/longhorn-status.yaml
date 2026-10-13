@@ -1,0 +1,10 @@
+---
+- name: Show Longhorn nodes and volumes
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Show Longhorn status
+      ansible.builtin.include_role:
+        name: longhorn
+        tasks_from: status.yaml
