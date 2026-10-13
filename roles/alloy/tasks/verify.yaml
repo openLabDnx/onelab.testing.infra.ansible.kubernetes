@@ -1,0 +1,141 @@
+---
+# A test trace and log line go into the Alloy on this node, the way an app's
+# OTLP exporter sends them, and must come back out of Jaeger and Loki through
+# Grafana. Then every node must be shipping its logs.
+- name: Find the Grafana API
+  ansible.builtin.include_role:
+    name: platform_vars
+    tasks_from: grafana_api.yaml
+
+- name: List the nodes
+  ansible.builtin.command: "{{ cluster_kubectl }} get nodes -o jsonpath={.items[*].metadata.name}"
+  register: alloy_nodes
+  changed_when: false
+
+# The pod on this node: traffic from a pod's own node always passes its NetworkPolicy.
+- name: Find the Alloy pod on this node
+  ansible.builtin.command: >
+    {{ alloy_kubectl }} get pods -l app.kubernetes.io/name=alloy,app.kubernetes.io/instance=alloy
+    --field-selector spec.nodeName={{ inventory_hostname }} -o jsonpath={.items[0].status.podIP}
+  register: alloy_local_pod
+  changed_when: false
+
+- name: Make up a test trace id
+  ansible.builtin.set_fact:
+    alloy_smoke_trace_id: "{{ lookup('ansible.builtin.password', '/dev/null chars=hexdigits length=32') | lower }}"
+    alloy_smoke_span_id: "{{ lookup('ansible.builtin.password', '/dev/null chars=hexdigits length=16') | lower }}"
+    # now() is local time, which timestamp() expects (a naive utc=true value would be off by the timezone)
+    alloy_smoke_ns: "{{ (now().timestamp() * 1000000000) | int }}"
+
+- name: Send a test trace and log line over OTLP
+  ansible.builtin.uri:
+    url: "http://{{ alloy_local_pod.stdout }}:4318/v1/{{ item.signal }}"
+    method: POST
+    body_format: json
+    body: "{{ item.body }}"
+  loop:
+    - signal: traces
+      body:
+        resourceSpans:
+          - resource: { attributes: [{ key: service.name, value: { stringValue: ansible-smoke } }] }
+            scopeSpans:
+              - scope: { name: ansible }
+                spans:
+                  - traceId: "{{ alloy_smoke_trace_id }}"
+                    spanId: "{{ alloy_smoke_span_id }}"
+                    name: smoke-check
+                    kind: 2
+                    startTimeUnixNano: "{{ alloy_smoke_ns }}"
+                    endTimeUnixNano: "{{ alloy_smoke_ns | int + 5000000 }}"
+    - signal: logs
+      body:
+        resourceLogs:
+          - resource: { attributes: [{ key: service.name, value: { stringValue: ansible-smoke } }] }
+            scopeLogs:
+              - scope: { name: ansible }
+                logRecords:
+                  - timeUnixNano: "{{ alloy_smoke_ns }}"
+                    severityNumber: 9
+                    severityText: INFO
+                    body: { stringValue: "ansible smoke check {{ alloy_smoke_trace_id }}" }
+                    traceId: "{{ alloy_smoke_trace_id }}"
+                    spanId: "{{ alloy_smoke_span_id }}"
+  loop_control:
+    label: "{{ item.signal }}"
+  changed_when: false
+
+- name: The trace is in Jaeger
+  ansible.builtin.uri:
+    url: "{{ grafana_api }}/datasources/proxy/uid/jaeger/api/traces/{{ alloy_smoke_trace_id }}"
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: [200, 404]
+  register: alloy_smoke_trace
+  until: alloy_smoke_trace.status == 200 and (alloy_smoke_trace.json.data | default([]) | length) > 0
+  retries: 18
+  delay: 10
+  no_log: true
+
+- name: The log line is in Loki, with its trace_id
+  ansible.builtin.uri:
+    url: >-
+      {{ grafana_api }}/datasources/proxy/uid/loki/loki/api/v1/query_range?{{ {
+        'query': '{service_name="ansible-smoke"} | trace_id="' ~ alloy_smoke_trace_id ~ '"',
+        'start': alloy_smoke_ns | int - 600000000000,
+        'end': alloy_smoke_ns | int + 600000000000,
+        'limit': 10} | urlencode }}
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  register: alloy_smoke_log
+  until: alloy_smoke_log.status == 200 and (alloy_smoke_log.json.data.result | default([]) | length) > 0
+  retries: 18
+  delay: 10
+  no_log: true
+
+# Instant LogQL metric queries: which nodes / sources shipped something.
+- name: Every node ships its logs
+  ansible.builtin.uri:
+    url: "{{ grafana_api }}/datasources/proxy/uid/loki/loki/api/v1/query?{{ {'query': item.query} | urlencode }}"
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  loop:
+    - { name: pod logs, query: 'sum by (node) (count_over_time({node=~".+", namespace=~".+"}[30m]))' }
+    - { name: journal, query: 'sum by (node) (count_over_time({job="node/journal"}[12h]))' }
+  loop_control:
+    label: "{{ item.name }}"
+  register: alloy_node_logs
+  until: >-
+    alloy_node_logs.status == 200 and
+    (alloy_node_logs.json.data.result | map(attribute='metric.node') | sort) == (alloy_nodes.stdout.split() | sort)
+  retries: 30
+  delay: 10
+  no_log: true
+
+- name: Kubernetes events reach Loki
+  ansible.builtin.uri:
+    url: "{{ grafana_api }}/datasources/proxy/uid/loki/loki/api/v1/query?{{ {'query': query} | urlencode }}"
+    url_username: "{{ grafana_admin_user }}"
+    url_password: "{{ grafana_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  vars:
+    query: 'sum(count_over_time({job="integrations/kubernetes/eventhandler"}[2h]))'
+  register: alloy_events
+  until: alloy_events.status == 200 and (alloy_events.json.data.result | length) > 0
+  retries: 18
+  delay: 10
+  no_log: true
+
+- name: Display logs and traces summary
+  ansible.builtin.debug:
+    msg:
+      - "Alloy on {{ alloy_nodes.stdout.split() | length }} nodes; test trace {{ alloy_smoke_trace_id }} found in Jaeger and its log line in Loki"
+      - "Logs from nodes: {{ alloy_node_logs.results[0].json.data.result | map(attribute='metric.node') | sort | join(', ') }} (pod logs, journal, kubelet); {{ alloy_events.json.data.result[0].value[1] }} Kubernetes events in the last 2 h"
+      - "Apps: OTEL_EXPORTER_OTLP_ENDPOINT=http://{{ alloy_otlp_service }}:4318 (or :4317 gRPC) -> traces in Jaeger, logs in Loki, metrics in Prometheus"
+      - "Grafana: Explore / Drilldown > Logs (Loki), Explore > Jaeger; dashboards in folders Kubernetes, Nodes, Logs"

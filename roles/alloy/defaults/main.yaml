@@ -1,0 +1,21 @@
+---
+# Defaults for alloy role
+# Grafana Alloy on every node (DaemonSet): ships the node's pod logs, its
+# journal and the RKE2 kubelet log to Loki, collects the Kubernetes events once
+# for the whole cluster (Alloy clustering), and is the OTLP entry point for the
+# apps: traces -> Jaeger, logs -> Loki, metrics -> Prometheus.
+alloy_chart_repo_url: "https://grafana.github.io/helm-charts"
+alloy_chart_version: "1.13.0"            # Alloy v1.20.0
+alloy_resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { memory: 512Mi }
+
+# Where Alloy sends (in-cluster)
+alloy_loki_url: "http://loki.{{ observability_namespace }}.svc.cluster.local:3100"
+alloy_jaeger_otlp_endpoint: "jaeger.{{ observability_namespace }}.svc.cluster.local:4317"
+alloy_prometheus_url: "http://kube-prometheus-stack-prometheus.{{ observability_namespace }}.svc.cluster.local:9090"
+
+# The address apps use; every node answers on its own Alloy (trafficDistribution)
+alloy_otlp_service: "alloy.{{ observability_namespace }}.svc.cluster.local"
+
+alloy_kubectl: "{{ cluster_kubectl }} -n {{ observability_namespace }}"

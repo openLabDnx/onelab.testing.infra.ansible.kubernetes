@@ -1,0 +1,127 @@
+# Jaeger v2 configuration (Managed by Ansible). Every endpoint listens on 0.0.0.0:
+# kubelet probes, Prometheus and the other pods use the pod IP.
+#   4317 / 4318  OTLP gRPC / HTTP (from Alloy)
+#   16686        UI + HTTP API (Grafana datasource, Traefik -> authentik)
+#   16685        gRPC query API
+#   13133        health (/status: 200 ready, 503 starting or stopping)
+#   8888         Jaeger's own metrics
+#   8889         span metrics (traces_span_metrics_*), scraped by Prometheus
+extensions:
+  healthcheckv2:
+    use_v2: true
+    http:
+      endpoint: 0.0.0.0:13133
+      status:
+        enabled: true
+        path: /status
+
+  jaeger_storage:
+    backends:
+      badger_store:
+        badger:
+          ephemeral: false
+          directories:
+            keys: /badger/keys
+            values: /badger/values
+          ttl:
+            spans: {{ jaeger_span_ttl }}
+          consistency: false            # no fsync per write
+          maintenance_interval: 5m      # value-log GC (frees disk after the TTL)
+          metrics_update_interval: 30s
+    metric_backends:
+      prometheus_store:
+        prometheus:
+          endpoint: {{ jaeger_prometheus_url }}
+          connect_timeout: 30s
+          # names after Prometheus scrapes the span_metrics connector below:
+          # traces_span_metrics_calls_total, traces_span_metrics_duration_milliseconds_*
+          metric_namespace: traces_span_metrics
+          latency_unit: ms
+          normalize_calls: true
+          normalize_duration: true
+
+  jaeger_query:
+    storage:
+      traces: badger_store
+      metrics: prometheus_store
+    # on by default: Jaeger would trace its own UI/API calls into this pipeline
+    enable_tracing: false
+    http:
+      endpoint: 0.0.0.0:16686
+    grpc:
+      endpoint: 0.0.0.0:16685
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80                # of the container memory limit
+    spike_limit_percentage: 20
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 1s
+
+connectors:
+  span_metrics:
+    namespace: traces.span.metrics
+    metrics_flush_interval: 15s
+    metrics_expiration: 1h              # forget services/pods that sent nothing for 1h
+    aggregation_cardinality_limit: 5000
+    histogram:
+      unit: ms
+      explicit:
+        buckets: [2ms, 4ms, 6ms, 8ms, 10ms, 50ms, 100ms, 200ms, 400ms, 800ms, 1s, 1400ms, 2s, 5s, 10s, 15s]
+    exemplars:
+      enabled: true
+      max_per_data_point: 5
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: badger_store
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    enable_open_metrics: true           # exemplars only exist in OpenMetrics
+    metric_expiration: 5m
+    resource_to_telemetry_conversion:
+      enabled: false
+
+service:
+  extensions: [healthcheckv2, jaeger_storage, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [jaeger_storage_exporter, span_metrics]
+    metrics/spanmetrics:
+      receivers: [span_metrics]
+      exporters: [prometheus]
+  telemetry:
+    resource:
+      attributes:
+        - name: service.name
+          value: jaeger
+    logs:
+      level: info
+      encoding: json
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+                # the Collector's usual names: no _total/unit suffixes, no otel_scope_* labels
+                without_scope_info: true
+                without_units: true
+                without_type_suffix: true

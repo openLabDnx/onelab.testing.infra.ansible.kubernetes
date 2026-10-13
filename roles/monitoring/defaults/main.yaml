@@ -3,6 +3,8 @@
 # kube-prometheus-stack (Prometheus Operator, Prometheus, Grafana, node-exporter,
 # kube-state-metrics) plus Kafka and RabbitMQ scraping, alerts and dashboards.
 # Free alternative to Confluent Control Center (production.md MSG-01 option B).
+# Grafana also gets the Loki (logs) and Jaeger (traces) datasources; those run
+# from roles/loki and roles/jaeger, fed by roles/alloy.
 kube_prometheus_stack_chart_repo_url: "https://prometheus-community.github.io/helm-charts"
 kube_prometheus_stack_chart_version: "91.7.0"
 
@@ -14,9 +16,23 @@ prometheus_resources:
   requests: { cpu: 250m, memory: 1Gi }
   limits: { memory: 3Gi }
 grafana_storage_size: "2Gi"
-grafana_admin_user: "admin"                        # break-glass; people log in through authentik
 
-# Dashboards loaded by Grafana's sidecar, pinned to the versions running here.
+# Apps can push OTLP metrics (through Alloy) to Prometheus' OTLP endpoint; these
+# resource attributes become labels (service.name/instance become job/instance).
+prometheus_otlp_promote_resource_attributes:
+  - k8s.namespace.name
+  - k8s.pod.name
+  - k8s.deployment.name
+  - k8s.statefulset.name
+  - k8s.daemonset.name
+  - k8s.node.name
+
+# In-cluster addresses of the log and trace backends (Grafana datasources)
+loki_url: "http://loki.{{ observability_namespace }}.svc.cluster.local:3100"
+jaeger_query_url: "http://jaeger.{{ observability_namespace }}.svc.cluster.local:16686"
+
+# Dashboards loaded by Grafana's sidecar, pinned to fixed versions: 'url' is
+# downloaded on the controller, 'file' comes from this role's files/.
 monitoring_dashboards:
   - { name: strimzi-kafka, folder: Kafka, url: "https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/{{ strimzi_dashboards_ref }}/packaging/examples/metrics/grafana-dashboards/strimzi-kafka.json" }
   - { name: strimzi-kraft, folder: Kafka, url: "https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/{{ strimzi_dashboards_ref }}/packaging/examples/metrics/grafana-dashboards/strimzi-kraft.json" }
@@ -24,8 +40,19 @@ monitoring_dashboards:
   - { name: strimzi-operators, folder: Kafka, url: "https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/{{ strimzi_dashboards_ref }}/packaging/examples/metrics/grafana-dashboards/strimzi-operators.json" }
   - { name: rabbitmq-overview, folder: RabbitMQ, url: "https://raw.githubusercontent.com/rabbitmq/rabbitmq-server/{{ rabbitmq_dashboards_ref }}/deps/rabbitmq_prometheus/docker/grafana/dashboards/RabbitMQ-Overview.json" }
   - { name: rabbitmq-quorum-queues, folder: RabbitMQ, url: "https://raw.githubusercontent.com/rabbitmq/rabbitmq-server/{{ rabbitmq_dashboards_ref }}/deps/rabbitmq_prometheus/docker/grafana/dashboards/RabbitMQ-Quorum-Queues-Raft.json" }
+  # every node-exporter metric per server (CPU, memory, disk, network, systemd)
+  - { name: node-exporter-full, folder: Nodes, url: "https://grafana.com/api/dashboards/1860/revisions/{{ node_exporter_full_revision }}/download" }
+  # modern cluster/namespace/node/pod views (dotdc), next to the chart's defaults
+  - { name: k8s-views-global, folder: Kubernetes, url: "{{ k8s_dashboards_url }}/k8s-views-global.json" }
+  - { name: k8s-views-namespaces, folder: Kubernetes, url: "{{ k8s_dashboards_url }}/k8s-views-namespaces.json" }
+  - { name: k8s-views-nodes, folder: Kubernetes, url: "{{ k8s_dashboards_url }}/k8s-views-nodes.json" }
+  - { name: k8s-views-pods, folder: Kubernetes, url: "{{ k8s_dashboards_url }}/k8s-views-pods.json" }
+  # pod logs from Loki (namespace / app / container / node / level / search)
+  - { name: k8s-pod-logs, folder: Logs, file: dashboards/k8s-pod-logs.json }
 strimzi_dashboards_ref: "1.2.0"
 rabbitmq_dashboards_ref: "v4.3.5"
+node_exporter_full_revision: 45
+k8s_dashboards_url: "https://raw.githubusercontent.com/dotdc/grafana-dashboards-kubernetes/v3.0.8/dashboards"
 
 # Strimzi's alert/recording rules (PrometheusRule), same version as the operator
 strimzi_rules_base_url: "https://raw.githubusercontent.com/strimzi/strimzi-kafka-operator/{{ strimzi_dashboards_ref }}/packaging/examples/metrics/prometheus-install/prometheus-rules"

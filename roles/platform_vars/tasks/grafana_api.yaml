@@ -1,0 +1,12 @@
+---
+# Sets grafana_api (http://<ClusterIP>/api) for checks run from the server node.
+# Loki and Jaeger only accept traffic from a few pods (NetworkPolicy), so their
+# checks go through Grafana's datasource API, which also tests the datasources.
+- name: Get the Grafana service address
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ observability_namespace }} get svc kube-prometheus-stack-grafana -o jsonpath={.spec.clusterIP}"
+  register: grafana_svc_ip
+  changed_when: false
+
+- name: Set the Grafana API address
+  ansible.builtin.set_fact:
+    grafana_api: "http://{{ grafana_svc_ip.stdout }}/api"

@@ -1,0 +1,55 @@
+# Grafana Alloy Helm values (Managed by Ansible)
+alloy:
+  configMap:
+    content: |
+      {{ lookup('ansible.builtin.template', 'config.alloy.j2') | indent(6) }}
+  # the pods find each other through the alloy-cluster Service; used to ship
+  # the Kubernetes events once
+  clustering:
+    enabled: true
+  enableReporting: false
+  # read positions survive pod restarts and upgrades (hostPath below), so
+  # nothing is shipped twice or skipped
+  storagePath: /var/lib/alloy/data
+  extraPorts:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317, protocol: TCP }
+    - { name: otlp-http, port: 4318, targetPort: 4318, protocol: TCP }
+  mounts:
+    varlog: true                         # /var/log/pods and /var/log/journal
+    extra:
+      - { name: kubelet-logs, mountPath: /var/lib/rancher/rke2/agent/logs, readOnly: true }
+      - { name: machine-id, mountPath: /etc/machine-id, readOnly: true }
+      - { name: storage, mountPath: /var/lib/alloy }
+  # Runs as root (the image default) to read the root-owned log files, but
+  # with no capabilities, so it can't read anything else on the node.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: { drop: ["ALL"] }
+    seccompProfile: { type: RuntimeDefault }
+  resources:
+    {{ alloy_resources | to_nice_yaml(indent=2) | trim | indent(4) }}
+
+controller:
+  type: daemonset
+  # every node, whatever taints it gets later
+  tolerations:
+    - operator: Exists
+  volumes:
+    extra:
+      - name: kubelet-logs
+        hostPath: { path: /var/lib/rancher/rke2/agent/logs, type: Directory }
+      - name: machine-id
+        hostPath: { path: /etc/machine-id, type: File }
+      - name: storage
+        hostPath: { path: /var/lib/alloy, type: DirectoryOrCreate }
+
+# alloy.{{ observability_namespace }}.svc: 12345 (UI/metrics), 4317/4318 (OTLP).
+# PreferSameNode: an app reaches the Alloy on its own node (no extra hop, and
+# the sender's pod IP identifies it), another node's only when that one is down.
+service:
+  enabled: true
+  trafficDistribution: PreferSameNode
+
+serviceMonitor:
+  enabled: true

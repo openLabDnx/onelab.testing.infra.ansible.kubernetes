@@ -2,7 +2,8 @@
 	storage vault vault-unseal vault-status vault-ui vault-reset \
 	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
 	apisix apisix-status apisix-admin apisix-reset \
-	platform traefik authentik argocd portainer messaging rabbitmq kafka monitoring
+	platform traefik authentik argocd portainer messaging rabbitmq kafka monitoring \
+	loki jaeger alloy
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -48,7 +49,10 @@ help:
 	@echo "make messaging  : cert-manager + RabbitMQ + Kafka (needs make platform)"
 	@echo "make rabbitmq   : RabbitMQ 3-node cluster, app users, UI behind SSO"
 	@echo "make kafka      : Kafka (Strimzi, KRaft x3), topics, users, Kafka UI behind SSO"
-	@echo "make monitoring : Prometheus + Grafana (SSO), Kafka/RabbitMQ dashboards and alerts"
+	@echo "make monitoring : Metrics + logs + traces: Prometheus, Grafana (SSO), Loki, Jaeger, Alloy"
+	@echo "make loki       : Loki (logs, 30 days) only"
+	@echo "make jaeger     : Jaeger (traces, UI behind SSO) only"
+	@echo "make alloy      : Alloy (log/trace collection) + end-to-end logs/traces check"
 	@echo "================================================================="
 
 check:
@@ -146,6 +150,15 @@ kafka:
 
 monitoring:
 	ansible-playbook playbooks/11-monitoring.yaml
+
+loki:
+	ansible-playbook playbooks/11-monitoring.yaml --tags loki
+
+jaeger:
+	ansible-playbook playbooks/11-monitoring.yaml --tags jaeger
+
+alloy:
+	ansible-playbook playbooks/11-monitoring.yaml --tags alloy
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

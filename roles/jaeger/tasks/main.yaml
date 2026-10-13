@@ -1,0 +1,45 @@
+---
+- name: Create observability namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ observability_namespace }}
+  register: jaeger_ns_apply
+  changed_when: jaeger_ns_apply.stdout is search('(created|configured)')
+
+# Server-side diff/apply: client-side apply reports the StatefulSet and the
+# PrometheusRule as changed on every run.
+- name: Check Jaeger for drift
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'jaeger.yaml.j2') }}"
+  register: jaeger_diff
+  changed_when: false
+  failed_when: jaeger_diff.rc > 1
+
+- name: Deploy Jaeger
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'jaeger.yaml.j2') }}"
+  when: jaeger_diff.rc == 1
+
+- name: Wait for Jaeger
+  ansible.builtin.command: "{{ jaeger_kubectl }} rollout status statefulset/jaeger --timeout=600s"
+  changed_when: false
+
+- name: Publish the Jaeger UI behind authentik
+  ansible.builtin.include_role:
+    name: traefik
+    tasks_from: protected_route.yaml
+  vars:
+    route_name: jaeger
+    route_namespace: "{{ observability_namespace }}"
+    route_host: "{{ jaeger_host }}"
+    route_service: jaeger
+    route_port: 16686
+
+- name: Verify Jaeger
+  ansible.builtin.import_tasks: verify.yaml

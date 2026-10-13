@@ -1,0 +1,40 @@
+---
+- name: Install / upgrade Loki
+  kubernetes.core.helm:
+    binary_path: "{{ helm_binary_path }}"
+    kubeconfig: "{{ rke2_kubeconfig_path }}"
+    release_name: loki
+    release_namespace: "{{ observability_namespace }}"
+    create_namespace: true
+    chart_repo_url: "{{ loki_chart_repo_url }}"
+    chart_ref: loki
+    chart_version: "{{ loki_chart_version }}"
+    release_values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+    # return right away and poll the rollout below (see roles/authentik)
+    wait: false
+
+- name: Wait for Loki
+  ansible.builtin.command: "{{ loki_kubectl }} rollout status statefulset/loki --timeout=600s"
+  register: loki_rollout
+  until: loki_rollout.rc == 0
+  retries: 6
+  delay: 10
+  changed_when: false
+
+# Server-side diff/apply: client-side apply reports the PrometheusRule as changed every run.
+- name: Check Loki NetworkPolicy and alerts for drift
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} diff --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'extras.yaml.j2') }}"
+  register: loki_extras_diff
+  changed_when: false
+  failed_when: loki_extras_diff.rc > 1
+
+- name: Apply Loki NetworkPolicy and alerts
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'extras.yaml.j2') }}"
+  when: loki_extras_diff.rc == 1
+
+- name: Verify Loki
+  ansible.builtin.import_tasks: verify.yaml
