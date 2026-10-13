@@ -1,0 +1,41 @@
+# Pod autoscaling for the stateless platform apps (Managed by Ansible).
+# CPU of the app's own container only (ContainerResource), so a sidecar never
+# skews it; see defaults/main.yaml for why the target is absolute millicores.
+{% for target in autoscaling_present %}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ target.name }}
+  namespace: {{ target.namespace }}
+  labels:
+    {{ autoscaling_label }}: "true"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ target.name }}
+  minReplicas: {{ target.min }}
+  maxReplicas: {{ target.max }}
+  metrics:
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: {{ target.container }}
+        target:
+          type: AverageValue
+          averageValue: {{ target.cpu }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ autoscaling_scale_up_window }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: {{ autoscaling_scale_down_window }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+{% endfor %}

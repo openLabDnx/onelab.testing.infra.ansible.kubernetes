@@ -1,0 +1,25 @@
+---
+# ScalingActive=True once the HPA reads the container's CPU from metrics-server.
+- name: Wait until every autoscaler reads its app's CPU
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ item.namespace }} get hpa {{ item.name }}
+    -o 'jsonpath={.status.conditions[?(@.type=="ScalingActive")].status}'
+  loop: "{{ autoscaling_present }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  register: autoscaling_active
+  until: autoscaling_active.stdout == 'True'
+  retries: 18
+  delay: 10
+  changed_when: false
+
+- name: Read the autoscalers
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} get hpa -A -l {{ autoscaling_label }}=true
+    -o custom-columns=NAMESPACE:.metadata.namespace,APP:.metadata.name,PODS:.status.currentReplicas,MIN:.spec.minReplicas,MAX:.spec.maxReplicas,CPU_PER_POD:.status.currentMetrics[0].containerResource.current.averageValue,TRIGGER:.spec.metrics[0].containerResource.target.averageValue
+  register: autoscaling_table
+  changed_when: false
+
+- name: Display autoscaling
+  ansible.builtin.debug:
+    msg: "{{ autoscaling_table.stdout_lines + ['A pod is added when the average CPU per pod stays above TRIGGER for a minute; removed after five quiet minutes. Grafana alerts KubeHpaMaxedOut when an app sits at MAX.'] }}"

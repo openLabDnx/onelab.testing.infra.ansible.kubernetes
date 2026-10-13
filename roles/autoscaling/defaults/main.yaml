@@ -1,0 +1,61 @@
+---
+# Defaults for autoscaling role
+# Pod autoscaling (HorizontalPodAutoscaler) for the stateless platform apps,
+# sized to the three servers. The servers themselves don't scale: these are
+# fixed Contabo VPS without a Cluster Autoscaler provider, so a new server is
+# still added by hand (inventory + make deploy).
+#
+# Not autoscaled, on purpose: Vault, etcd, Kafka, RabbitMQ and PostgreSQL (a
+# member count change is a quorum change), Grafana and Portainer (one pod on a
+# ReadWriteOnce volume), Traefik (a DaemonSet, already one pod per node) and
+# APISIX (its own HPA in roles/apisix).
+#
+# Room to grow: apps that use the eu database only run on master + worker2, and
+# the 12 GiB master has ~73% of its memory requested, so their extra pods land
+# mostly on worker2 (~14 GiB free). All targets at their maximum together add
+# ~0.5 CPU and ~2.2 GiB of requests. cloudflared may also use worker1.
+#
+# Each target scales on the average CPU actually used per pod (millicores), not
+# on a percentage of the request: today's requests are far below normal use
+# (e.g. authentik's server uses 35-120m against a 100m request), so a
+# percentage would keep every app at its maximum. min is the replica count the
+# app's own role sets, so re-running that role resets the app to min and the
+# HPA scales it up again if needed (as with APISIX).
+autoscaling_targets:
+  - name: authentik-server               # every SSO login (password hashing is CPU)
+    namespace: "{{ authentik_namespace }}"
+    container: server
+    min: 2
+    max: 4
+    cpu: 300m
+  - name: argocd-server                  # UI / API
+    namespace: "{{ argocd_namespace }}"
+    container: server
+    min: 2
+    max: 3
+    cpu: 200m
+  - name: argocd-repo-server             # renders manifests on every sync
+    namespace: "{{ argocd_namespace }}"
+    container: repo-server
+    min: 2
+    max: 4
+    cpu: 400m
+  - name: kafka-ui
+    namespace: "{{ kafka_namespace }}"
+    container: kafka-ui
+    min: 2
+    max: 3
+    cpu: 300m
+  - name: cloudflared                    # every public request passes through it
+    namespace: cloudflared
+    container: cloudflared
+    min: 2
+    max: 4
+    cpu: 150m
+
+# Same pace as the APISIX HPA: up by at most one pod a minute after a minute of
+# load, down by one pod every two minutes after five quiet minutes.
+autoscaling_scale_up_window: 60
+autoscaling_scale_down_window: 300
+
+autoscaling_label: "autofik.com/autoscaling"

@@ -47,6 +47,9 @@ autofik.infra.testing/
 │   │   ├── tasks/
 │   │   └── templates/values.yaml.j2
 │   ├── cloudflare_tunnel/       # Tunnel, routes, DNS, Access (Cloudflare API) + cloudflared
+│   │   ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
+│   │   ├── tasks/
+│   │   └── templates/cloudflared.yaml.j2
 │   ├── apisix/                  # APISIX gateway + etcd x3, Admin UI, PDB/HPA/NetworkPolicy, smoke test
 │   │   ├── defaults/main.yaml   # Chart/image pins, replicas, HPA, etcd, real-IP settings
 │   │   ├── tasks/
@@ -64,10 +67,8 @@ autofik.infra.testing/
 │   ├── monitoring/              # kube-prometheus-stack, Grafana SSO + datasources, node-exporter behind kube-rbac-proxy, dashboards
 │   ├── loki/                    # Loki (logs, 30 days), NetworkPolicy, alerts
 │   ├── jaeger/                  # Jaeger v2 (traces, 7 days, span metrics), UI behind authentik, NetworkPolicy, alerts
-│   └── alloy/                   # Grafana Alloy on every node: logs + events -> Loki, OTLP -> Jaeger/Loki/Prometheus
-│       ├── defaults/main.yaml   # Zone, hostnames, routes, allowed emails, image
-│       ├── tasks/
-│       └── templates/cloudflared.yaml.j2
+│   ├── alloy/                   # Grafana Alloy on every node: logs + events -> Loki, OTLP -> Jaeger/Loki/Prometheus
+│   └── autoscaling/             # Pod autoscaling (HPA) for the stateless platform apps
 ├── playbooks/
 │   ├── 01-prerequisites.yaml    # Node system tuning & preparation
 │   ├── 02-rke2-server.yaml      # Master control-plane deployment
@@ -90,6 +91,7 @@ autofik.infra.testing/
 │   ├── 09-platform.yaml         # Traefik, CloudNativePG, authentik, Argo CD, Portainer (tags per part)
 │   ├── 10-messaging.yaml        # cert-manager, RabbitMQ, Kafka (tags per part)
 │   ├── 11-monitoring.yaml       # Metrics, logs, traces: Prometheus, Grafana, Loki, Jaeger, Alloy (tags per part)
+│   ├── 12-autoscaling.yaml      # Pod autoscaling (HPA) for authentik, Argo CD, Kafka UI, cloudflared
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
@@ -570,6 +572,30 @@ OTEL_METRICS_EXPORTER=otlp       # lands in Prometheus (or keep exposing /metric
 - **No Alertmanager yet** (same as the master cluster): rules are evaluated and shown in Grafana, but nothing is sent. Add a receiver (Slack, email) and set `alertmanager.enabled: true` in `roles/monitoring/templates/values.yaml.j2`. `PrometheusNotConnectedToAlertmanagers` is switched off until then.
 - **Control-plane scraping is off:** RKE2 binds etcd, the scheduler, the controller-manager and kube-proxy to localhost, so those targets are disabled instead of showing as permanently down.
 - **Upgrades:** bump the version in the role's `defaults/main.yaml` and re-run its `make` target. Jaeger's volume size can't be changed in place (StatefulSet): delete the StatefulSet with `--cascade=orphan`, then re-run `make jaeger`.
+
+---
+
+## 📐 Autoscaling
+
+The stateless platform apps get more pods under load and fewer when it passes (HorizontalPodAutoscaler, CPU read from RKE2's metrics-server):
+
+| App | Pods (min-max) | One more pod when the average CPU per pod stays above |
+| :--- | :--- | :--- |
+| authentik server (every SSO login) | 2-4 | 300m |
+| Argo CD server | 2-3 | 200m |
+| Argo CD repo-server (renders manifests on sync) | 2-4 | 400m |
+| Kafka UI | 2-3 | 300m |
+| cloudflared (every public request) | 2-4 | 150m |
+| APISIX gateway (roles/apisix) | 2-3 | 70% of its CPU request |
+
+```bash
+make autoscaling   # creates/updates the autoscalers, waits until each reads its app's CPU, shows them
+```
+- **Sized to these servers:** authentik, Argo CD and Kafka UI run only on master + worker2 (next to the database), and the 12 GiB master already has ~73% of its memory requested, so their extra pods land mostly on worker2. All of them at their maximum add ~0.5 CPU and ~2.2 GiB of requests. cloudflared may also use worker1.
+- **Absolute CPU, not a percentage:** the apps' CPU requests are far below their normal use, so a percentage of the request would keep them at their maximum all the time. Change the limits in `roles/autoscaling/defaults/main.yaml` and re-run `make autoscaling`.
+- **Pace:** up by at most one pod a minute after a minute of load; down by one pod every two minutes after five quiet minutes. Grafana alerts (*KubeHpaMaxedOut*) when an app stays at its maximum.
+- **Re-running an app's role** (`make authentik`, `make argocd`, ...) resets it to its minimum; the autoscaler adds pods again within minutes if the load is still there.
+- **Not autoscaled:** Vault, etcd, Kafka, RabbitMQ and PostgreSQL (changing their member count changes their quorum), Grafana and Portainer (one pod on its volume), Traefik (one per node). **The servers themselves don't autoscale:** fixed Contabo VPS have no Cluster Autoscaler provider, so a new server is added by hand (inventory + `make deploy`).
 
 ---
 

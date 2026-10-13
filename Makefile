@@ -4,7 +4,7 @@
 	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
 	apisix apisix-status apisix-admin apisix-reset \
 	platform traefik authentik argocd portainer messaging rabbitmq kafka monitoring \
-	loki jaeger alloy
+	loki jaeger alloy autoscaling
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -58,6 +58,7 @@ help:
 	@echo "make loki       : Loki (logs, 30 days) only"
 	@echo "make jaeger     : Jaeger (traces, UI behind SSO) only"
 	@echo "make alloy      : Alloy (log/trace collection) + end-to-end logs/traces check"
+	@echo "make autoscaling: Pod autoscaling (HPA) for authentik, Argo CD, Kafka UI, cloudflared"
 	@echo "================================================================="
 
 check:
@@ -175,6 +176,9 @@ jaeger:
 
 alloy:
 	ansible-playbook playbooks/11-monitoring.yaml --tags alloy
+
+autoscaling:
+	ansible-playbook playbooks/12-autoscaling.yaml
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

@@ -1,0 +1,3 @@
+---
+dependencies:
+  - role: platform_vars

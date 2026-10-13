@@ -1,0 +1,10 @@
+---
+# Pod autoscaling (HPA) for the stateless platform apps: authentik, Argo CD,
+# Kafka UI and cloudflared, sized to the three servers (roles/autoscaling).
+# Apps that are not deployed yet are skipped; re-run once they are.
+- name: Pod autoscaling
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  roles:
+    - autoscaling
