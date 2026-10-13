@@ -1,0 +1,66 @@
+---
+# RabbitMQ belongs to its cluster operator: pause the operator for this
+# cluster, stop all nodes, move the claims, set the new class, then let the
+# operator re-create the StatefulSet (its claim template can't be changed).
+# All nodes start together and find their data.
+# in: migration_namespace, migration_class, migration_rabbitmq (RabbitmqCluster name)
+- name: RabbitMQ | find claims still on local-path
+  ansible.builtin.include_tasks: pending.yaml
+  vars:
+    migration_claim_pattern: "^persistence-{{ migration_rabbitmq }}-server-[0-9]+$"
+
+- name: RabbitMQ | is the operator paused for this cluster (earlier run)
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} get rabbitmqcluster {{ migration_rabbitmq }}
+    -o 'jsonpath={.metadata.labels.rabbitmq\.com/pauseReconciliation}'
+  register: migration_rabbitmq_paused
+  changed_when: false
+
+- name: RabbitMQ | move its claims
+  when: migration_pending | length > 0 or migration_rabbitmq_paused.stdout == 'true'
+  block:
+    - name: RabbitMQ | pause the operator for this cluster
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} label rabbitmqcluster {{ migration_rabbitmq }}
+        rabbitmq.com/pauseReconciliation=true --overwrite
+      changed_when: true
+
+    - name: RabbitMQ | stop all nodes
+      ansible.builtin.include_tasks: workload_stop.yaml
+      vars:
+        migration_workload: { kind: statefulset, name: "{{ migration_rabbitmq }}-server" }
+
+    - name: RabbitMQ | move the claims
+      ansible.builtin.include_tasks: claim.yaml
+      loop: "{{ migration_pending }}"
+      loop_control:
+        loop_var: migration_claim
+
+    - name: RabbitMQ | new class in the cluster spec
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} patch rabbitmqcluster {{ migration_rabbitmq }}
+        --type merge -p '{{ {"spec": {"persistence": {"storageClassName": migration_class}}} | to_json }}'
+      changed_when: true
+
+    - name: RabbitMQ | delete the StatefulSet, keeping its claims
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} delete statefulset {{ migration_rabbitmq }}-server
+        --cascade=orphan --ignore-not-found --wait=true
+      changed_when: true
+
+    - name: RabbitMQ | resume the operator (it re-creates the StatefulSet)
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} label rabbitmqcluster {{ migration_rabbitmq }}
+        rabbitmq.com/pauseReconciliation-
+      changed_when: true
+
+    - name: RabbitMQ | wait for every node
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} wait rabbitmqcluster/{{ migration_rabbitmq }}
+        --for=condition=AllReplicasReady --timeout=900s
+      changed_when: false
+
+    - name: RabbitMQ | back, drop the saved spec
+      ansible.builtin.file:
+        path: "{{ migration_state_dir }}/statefulset-{{ migration_namespace }}-{{ migration_rabbitmq }}-server.json"
+        state: absent

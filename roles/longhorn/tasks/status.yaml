@@ -1,0 +1,22 @@
+---
+- name: Read Longhorn nodes
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} get nodes.longhorn.io -o custom-columns='NODE:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,SCHEDULABLE:.status.conditions[?(@.type=="Schedulable")].status,TAGS:.spec.tags'
+  register: longhorn_status_nodes
+  changed_when: false
+
+- name: Read Longhorn volumes
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} get volumes.longhorn.io -o custom-columns='NAMESPACE:.status.kubernetesStatus.namespace,CLAIM:.status.kubernetesStatus.pvcName,STATE:.status.state,ROBUSTNESS:.status.robustness,COPIES:.spec.numberOfReplicas,LOCALITY:.spec.dataLocality,NODE:.status.currentNodeID,SIZE:.spec.size,USED:.status.actualSize'
+  register: longhorn_status_volumes
+  changed_when: false
+
+- name: Display Longhorn status
+  ansible.builtin.debug:
+    msg: "{{ longhorn_status_nodes.stdout_lines + [''] + longhorn_status_volumes.stdout_lines }}"
+
+# attached volumes only: a detached volume reports robustness "unknown"
+- name: Warn about volumes that lost a copy or failed
+  ansible.builtin.debug:
+    msg: "Not healthy: {{ longhorn_status_volumes.stdout_lines | select('search', ' (degraded|faulted) ') | list }}"
+  when: longhorn_status_volumes.stdout_lines | select('search', ' (degraded|faulted) ') | list | length > 0

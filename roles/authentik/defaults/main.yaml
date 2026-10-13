@@ -16,11 +16,15 @@ authentik_db_cluster: "authentik-db"
 authentik_db_instances: 2
 authentik_db_image: "ghcr.io/cloudnative-pg/postgresql:18.6-standard-trixie"
 authentik_db_size: "10Gi"
-authentik_db_storage_class: "local-path-retain"
+# Longhorn, one copy on the instance's own node (roles/longhorn): PostgreSQL
+# replication keeps the second copy.
+authentik_db_storage_class: "longhorn-local-retain"
 
-# Daily pg_dump (custom format) to a separate volume, kept 14 days.
+# Daily pg_dump (custom format) to a separate volume, kept 14 days. Two Longhorn
+# copies (one per primary-site node), so the dumps survive losing a node.
 authentik_backup_schedule: "30 2 * * *"
 authentik_backup_retention_days: 14
 authentik_backup_size: "10Gi"
+authentik_backup_storage_class: "longhorn-retain"
 
 authentik_kubectl: "{{ cluster_kubectl }} -n {{ authentik_namespace }}"

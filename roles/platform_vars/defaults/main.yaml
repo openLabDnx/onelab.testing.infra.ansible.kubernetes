@@ -11,6 +11,7 @@ rabbitmq_host: "rabbitmq.{{ platform_domain }}"
 kafka_ui_host: "kafka.{{ platform_domain }}"
 grafana_host: "grafana.{{ platform_domain }}"
 jaeger_host: "jaeger.{{ platform_domain }}"
+longhorn_host: "longhorn.{{ platform_domain }}"
 
 authentik_namespace: "authentik"
 argocd_namespace: "argocd"
@@ -18,6 +19,7 @@ portainer_namespace: "portainer"
 rabbitmq_namespace: "rabbitmq"
 kafka_namespace: "kafka"
 observability_namespace: "observability"
+longhorn_namespace: "longhorn-system"
 
 # authentik group whose members administer Argo CD, Portainer and the admin UIs below
 platform_admin_group: "platform-admins"
@@ -29,6 +31,7 @@ platform_forward_auth_apps:
   - { slug: rabbitmq, name: "RabbitMQ management", host: "{{ rabbitmq_host }}", launch_path: / }
   - { slug: kafka-ui, name: "Kafka UI", host: "{{ kafka_ui_host }}", launch_path: / }
   - { slug: jaeger, name: "Jaeger", host: "{{ jaeger_host }}", launch_path: /search }
+  - { slug: longhorn, name: "Longhorn", host: "{{ longhorn_host }}", launch_path: / }
 
 # Generated credentials live here on the controller (git-ignored)
 platform_secrets_dir: "{{ inventory_dir }}/../secrets/platform"

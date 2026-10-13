@@ -1,0 +1,41 @@
+---
+# Scales a StatefulSet or Deployment to zero and waits for its pods to be gone.
+# Its spec is saved on the server first (once: a re-run after a failure must
+# not save the scaled-down copy); workload_start.yaml brings it back from it.
+# in: migration_namespace, migration_workload ({kind: statefulset|deployment, name})
+- name: "{{ migration_workload.name }} | saved spec"
+  ansible.builtin.set_fact:
+    migration_workload_file: "{{ migration_state_dir }}/{{ migration_workload.kind }}-{{ migration_namespace }}-{{ migration_workload.name }}.json"
+
+- name: "{{ migration_workload.name }} | keep its spec until it is back"
+  ansible.builtin.shell: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} get {{ migration_workload.kind }} {{ migration_workload.name }} -o json
+    > {{ migration_workload_file }}.tmp && mv {{ migration_workload_file }}.tmp {{ migration_workload_file }}
+  args:
+    creates: "{{ migration_workload_file }}"
+
+- name: "{{ migration_workload.name }} | read the saved spec"
+  ansible.builtin.slurp:
+    src: "{{ migration_workload_file }}"
+  register: migration_workload_raw
+
+- name: "{{ migration_workload.name }} | does it still exist"
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ migration_namespace }} get {{ migration_workload.kind }} {{ migration_workload.name }} --ignore-not-found -o name"
+  register: migration_workload_exists
+  changed_when: false
+
+- name: "{{ migration_workload.name }} | scale to zero"
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ migration_namespace }} scale {{ migration_workload.kind }} {{ migration_workload.name }} --replicas=0"
+  when: migration_workload_exists.stdout | length > 0
+  changed_when: true
+
+- name: "{{ migration_workload.name }} | wait for its pods to stop"
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ migration_namespace }} get pods -l {{ migration_selector }} -o name"
+  vars:
+    migration_labels: "{{ (migration_workload_raw.content | b64decode | from_json).spec.selector.matchLabels }}"
+    migration_selector: "{{ migration_labels | dict2items | map(attribute='key') | zip(migration_labels | dict2items | map(attribute='value')) | map('join', '=') | join(',') }}"
+  register: migration_workload_pods
+  until: migration_workload_pods.stdout | length == 0
+  retries: 60
+  delay: 5
+  changed_when: false

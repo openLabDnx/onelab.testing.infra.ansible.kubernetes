@@ -1,5 +1,6 @@
 .PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods \
-	storage vault vault-unseal vault-status vault-ui vault-reset \
+	storage longhorn longhorn-status storage-migrate local-path-remove \
+	vault vault-unseal vault-status vault-ui vault-reset \
 	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
 	apisix apisix-status apisix-admin apisix-reset \
 	platform traefik authentik argocd portainer messaging rabbitmq kafka monitoring \
@@ -23,7 +24,11 @@ help:
 	@echo "make pods        : Run kubectl get pods -A (using local kubeconfig)"
 	@echo "make reset       : Cleanly uninstall RKE2 from all nodes"
 	@echo "-----------------------------------------------------------------"
-	@echo "make storage     : Install local-path-provisioner StorageClasses"
+	@echo "make storage     : Longhorn: node prerequisites, StorageClasses, smoke test, UI behind SSO"
+	@echo "make longhorn    : Same as make storage"
+	@echo "make longhorn-status : Longhorn nodes and volumes (copies, health, size)"
+	@echo "make storage-migrate : Move the volumes still on local-path to Longhorn (app by app)"
+	@echo "make local-path-remove : Remove local-path-provisioner once nothing uses it"
 	@echo "make vault       : Deploy Vault HA (storage -> helm -> init -> unseal)"
 	@echo "make vault-unseal: Unseal Vault pods after a restart"
 	@echo "make vault-status: Show Vault pods, seal state and raft peers"
@@ -84,6 +89,17 @@ reset:
 
 storage:
 	ansible-playbook playbooks/05-storage.yaml
+
+longhorn: storage
+
+longhorn-status:
+	ansible-playbook playbooks/longhorn-status.yaml
+
+storage-migrate:
+	ansible-playbook playbooks/storage-migrate.yaml
+
+local-path-remove:
+	ansible-playbook playbooks/local-path-remove.yaml
 
 vault:
 	ansible-playbook playbooks/05-storage.yaml playbooks/06-vault.yaml

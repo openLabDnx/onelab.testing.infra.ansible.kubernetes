@@ -1,7 +1,32 @@
 ---
-- name: Install local-path-provisioner (node-local PersistentVolumes)
+# Longhorn: replicated block storage for every PersistentVolume. Node
+# prerequisites on every node first, then Longhorn, its StorageClasses and a
+# smoke test. The UI goes behind authentik once authentik exists (until then
+# 09-platform publishes it). Volumes still on local-path: playbooks/storage-migrate.yaml.
+- name: Longhorn node prerequisites (iSCSI, NFS client, no multipathd)
+  hosts: rke2_cluster
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Prepare the node for Longhorn
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: longhorn.yaml
+
+- name: Longhorn
   hosts: "{{ groups['rke2_servers'][0] }}"
   become: yes
   gather_facts: no
   roles:
-    - local_path_provisioner
+    - longhorn
+
+- name: Longhorn UI behind authentik
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [ui]
+  tasks:
+    - name: Publish the Longhorn UI
+      ansible.builtin.include_role:
+        name: longhorn
+        tasks_from: ui.yaml

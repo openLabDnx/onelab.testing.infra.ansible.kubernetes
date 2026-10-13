@@ -1,0 +1,20 @@
+---
+# Fails while a pod that is not finished still mounts the claim: its app must be
+# stopped, or the copy would miss its latest writes.
+# in: migration_namespace, migration_claim, migration_ns_kubectl
+- name: "{{ migration_claim }} | list the pods and their claims"
+  ansible.builtin.command: >-
+    {{ migration_ns_kubectl }} get pods -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{range .spec.volumes[*]} {.persistentVolumeClaim.claimName}{end}{"\n"}{end}'
+  register: migration_pod_claims
+  changed_when: false
+
+- name: "{{ migration_claim }} | nothing uses it"
+  ansible.builtin.assert:
+    that: migration_claim_users | length == 0
+    fail_msg: "{{ migration_namespace }}/{{ migration_claim }} is still used by pod(s) {{ migration_claim_users | map('split') | map('first') | list }}; stop them first."
+    quiet: true
+  vars:
+    migration_claim_users: >-
+      {{ migration_pod_claims.stdout_lines
+         | select('search', ' ' ~ (migration_claim | regex_escape) ~ '( |$)')
+         | reject('search', '^[^ ]+ (Succeeded|Failed)( |$)') | list }}

@@ -1,0 +1,31 @@
+---
+# Removes the smoke-test pods, claims and volumes. The classes keep volumes
+# (Retain), so the volumes are switched to Delete first and Longhorn deletes them.
+- name: Find smoke-test volumes
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} get pvc -l app.kubernetes.io/name=longhorn-smoke-test
+    -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}'
+  register: longhorn_smoke_pvs
+  changed_when: false
+
+- name: Let Longhorn delete the smoke-test volumes
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} patch pv {{ item }}
+    -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+  loop: "{{ longhorn_smoke_pvs.stdout_lines | select | list }}"
+  changed_when: false
+
+- name: Delete smoke-test pods and claims
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} delete pod,pvc -l app.kubernetes.io/name=longhorn-smoke-test
+    --ignore-not-found --wait=true --timeout=180s
+  changed_when: false
+
+- name: Wait for the smoke-test volumes to be deleted
+  ansible.builtin.command: "{{ cluster_kubectl }} get pv {{ item }} --ignore-not-found -o name"
+  loop: "{{ longhorn_smoke_pvs.stdout_lines | select | list }}"
+  register: longhorn_smoke_pv_gone
+  until: longhorn_smoke_pv_gone.stdout | length == 0
+  retries: 30
+  delay: 5
+  changed_when: false

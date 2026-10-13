@@ -1,0 +1,38 @@
+# Longhorn StorageClasses used by the roles (Managed by Ansible). Kubernetes
+# never changes a StorageClass's parameters: to change one, delete the class
+# and re-run; volumes made before keep the settings they were made with.
+#
+# Two copies on the primary-site nodes (Longhorn node tag), one of them on the
+# pod's node when possible. For apps that run a single copy.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ longhorn_replicated_class }}
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "{{ longhorn_replicated_replicas }}"
+  nodeSelector: "{{ platform_primary_site }}"
+  dataLocality: best-effort
+  staleReplicaTimeout: "30"
+  fsType: ext4
+  dataEngine: v1
+---
+# One copy, on the node that first uses the volume; Longhorn then pins the
+# volume (and so its pod) to that node. For apps that replicate their own data.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ longhorn_local_class }}
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "1"
+  dataLocality: strict-local
+  staleReplicaTimeout: "30"
+  fsType: ext4
+  dataEngine: v1

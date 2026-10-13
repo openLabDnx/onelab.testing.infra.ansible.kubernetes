@@ -1,0 +1,28 @@
+---
+# Defaults for local_path_migration role
+# One-time move of the volumes still on local-path onto Longhorn, app by app
+# (playbooks/storage-migrate.yaml). Each claim keeps its name, labels and
+# owners, so its app finds the data again. The old local-path volume is kept
+# (reclaimPolicy Retain, labelled autofik.com/migrated-to-longhorn) until
+# playbooks/local-path-remove.yaml.
+migration_source_classes:
+  - local-path
+  - local-path-retain
+
+# GNU cp/find/sha256sum for the copy jobs (same image as the Longhorn smoke test)
+migration_copy_image: "docker.io/library/debian:trixie-20260918-slim"
+migration_copy_timeout: 3600                    # seconds per volume
+
+# On the server node: what a run needs to resume after a failure (the spec of a
+# stopped StatefulSet, a claim between its old and new volume). Removed once done.
+migration_state_dir: "/opt/autofik/migration"
+
+migration_migrated_label: "autofik.com/migrated-to-longhorn"
+
+# Set by the provisioner and the binder for the old volume, not carried over
+migration_dropped_annotations:
+  - pv.kubernetes.io/bind-completed
+  - pv.kubernetes.io/bound-by-controller
+  - volume.beta.kubernetes.io/storage-provisioner
+  - volume.kubernetes.io/storage-provisioner
+  - volume.kubernetes.io/selected-node

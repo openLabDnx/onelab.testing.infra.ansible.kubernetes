@@ -11,16 +11,17 @@
     grafana_api: "http://{{ monitoring_svc.results[1].stdout }}:80/api"
 
 # New PodMonitors/ServiceMonitors take a reload plus a scrape interval to show up.
-- name: Wait until every Kafka and RabbitMQ target is scraped and up
+- name: Wait until every Kafka, RabbitMQ and Longhorn target is scraped and up
   ansible.builtin.uri:
     url: "{{ prometheus_api }}/query?query={{ query | urlencode }}"
     return_content: true
   vars:
-    query: 'count by (namespace) (up{namespace=~"{{ kafka_namespace }}|{{ rabbitmq_namespace }}"})'
+    query: 'count by (namespace) (up{namespace=~"{{ kafka_namespace }}|{{ rabbitmq_namespace }}|{{ longhorn_namespace }}"})'
   register: monitoring_targets
   until: >-
     monitoring_targets.json.data.result | selectattr('metric.namespace', 'equalto', kafka_namespace) | list | length > 0
     and monitoring_targets.json.data.result | selectattr('metric.namespace', 'equalto', rabbitmq_namespace) | list | length > 0
+    and monitoring_targets.json.data.result | selectattr('metric.namespace', 'equalto', longhorn_namespace) | list | length > 0
   retries: 30
   delay: 10
 
@@ -48,6 +49,8 @@
     - { name: offline_partitions, query: 'sum(kafka_controller_kafkacontroller_offlinepartitionscount)' }
     - { name: rabbitmq_nodes, query: 'count(rabbitmq_identity_info)' }
     - { name: nodes_scraped, query: 'count(node_uname_info)' }
+    - { name: longhorn_managers, query: 'count(up{namespace="{{ longhorn_namespace }}"} == 1) or vector(0)' }
+    - { name: longhorn_volumes_unhealthy, query: 'count(longhorn_volume_robustness > 1) or vector(0)' }
   loop_control:
     label: "{{ item.name }}"
   register: monitoring_metrics
@@ -131,6 +134,7 @@
       - monitoring_values.offline_partitions == 0
       - monitoring_values.rabbitmq_nodes == monitoring_expected_rabbitmq_nodes
       - monitoring_values.nodes_scraped == groups['rke2_cluster'] | length
+      - monitoring_values.longhorn_managers == groups['rke2_cluster'] | length
       - monitoring_datasources.json | map(attribute='uid') | sort == ['jaeger', 'loki', 'prometheus']
     fail_msg: >-
       monitoring check failed: {{ monitoring_values | to_json }},
@@ -143,6 +147,7 @@
       - "Prometheus: {{ monitoring_values.targets_up }} Kafka/RabbitMQ targets up, {{ monitoring_values.targets_down }} down; {{ monitoring_values.nodes_scraped }} nodes (node-exporter behind kube-rbac-proxy, anonymous :9100 refused)"
       - "Kafka: {{ monitoring_values.kafka_brokers }} brokers, {{ monitoring_values.under_replicated }} under-replicated, {{ monitoring_values.offline_partitions }} offline partitions"
       - "RabbitMQ: {{ monitoring_values.rabbitmq_nodes }} nodes"
+      - "Longhorn: {{ monitoring_values.longhorn_managers }} managers scraped, {{ monitoring_values.longhorn_volumes_unhealthy }} volume(s) degraded or faulted"
       - "Dashboards: {{ monitoring_dashboards | length }} in folders {{ monitoring_dashboards | map(attribute='folder') | unique | join(', ') }} (+ the chart's own in Kubernetes)"
       - "Datasources: {{ monitoring_datasources.json | map(attribute='name') | sort | join(', ') }}"
       - "Grafana: https://{{ grafana_host }}/ (signs in through authentik; break-glass https://{{ grafana_host }}/login?disableAutoLogin as admin / {{ platform_secrets_dir }}/grafana_admin_password)"

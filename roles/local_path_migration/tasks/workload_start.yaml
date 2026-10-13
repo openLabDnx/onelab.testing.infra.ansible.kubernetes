@@ -1,0 +1,77 @@
+---
+# Brings back a workload stopped by workload_stop.yaml with its saved replica
+# count. A StatefulSet is re-created (its claim templates can't be changed) with
+# migration_class in them, so the owning role's next run finds nothing to change;
+# its existing claims, now on Longhorn, are picked up by name.
+# in: migration_namespace, migration_workload ({kind, name}), migration_class
+- name: "{{ migration_workload.name }} | read the saved spec"
+  ansible.builtin.slurp:
+    src: "{{ migration_state_dir }}/{{ migration_workload.kind }}-{{ migration_namespace }}-{{ migration_workload.name }}.json"
+  register: migration_workload_raw
+
+- name: "{{ migration_workload.name }} | parse it"
+  ansible.builtin.set_fact:
+    migration_saved: "{{ migration_workload_raw.content | b64decode | from_json }}"
+
+- name: "{{ migration_workload.name }} | read the StatefulSet's claim templates"
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} get statefulset {{ migration_workload.name }} --ignore-not-found
+    -o jsonpath='{range .spec.volumeClaimTemplates[*]}{.spec.storageClassName}{"\n"}{end}'
+  register: migration_sts_classes
+  when: migration_workload.kind == 'statefulset'
+  changed_when: false
+
+- name: "{{ migration_workload.name }} | re-create the StatefulSet with {{ migration_class }}"
+  when:
+    - migration_workload.kind == 'statefulset'
+    - migration_sts_classes.stdout_lines | length == 0 or migration_sts_classes.stdout_lines | unique != [migration_class]
+  block:
+    - name: "{{ migration_workload.name }} | delete the StatefulSet, keeping its claims"
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} -n {{ migration_namespace }} delete statefulset {{ migration_workload.name }}
+        --cascade=orphan --ignore-not-found --wait=true
+      changed_when: true
+
+    - name: "{{ migration_workload.name }} | create it again"
+      ansible.builtin.command:
+        cmd: "{{ cluster_kubectl }} create -f -"
+        stdin: "{{ migration_sts_manifest | to_json }}"
+      vars:
+        migration_sts_manifest:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: "{{ migration_workload.name }}"
+            namespace: "{{ migration_namespace }}"
+            labels: "{{ migration_saved.metadata.labels | default({}, true) }}"
+            annotations: "{{ migration_saved.metadata.annotations | default({}, true) }}"
+          spec: >-
+            {{ migration_saved.spec | combine({'volumeClaimTemplates':
+                 migration_saved.spec.volumeClaimTemplates | default([])
+                 | map('combine', {'spec': {'storageClassName': migration_class}}, recursive=true) | list}) }}
+      changed_when: true
+
+- name: "{{ migration_workload.name }} | scale back to {{ migration_saved.spec.replicas }}"
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} scale {{ migration_workload.kind }} {{ migration_workload.name }}
+    --replicas={{ migration_saved.spec.replicas }}
+  changed_when: false
+
+# Running, not Ready: Vault pods only become Ready once unsealed by roles/vault.
+- name: "{{ migration_workload.name }} | wait for its pods to run"
+  ansible.builtin.command: >-
+    {{ cluster_kubectl }} -n {{ migration_namespace }} get pods -l {{ migration_selector }}
+    -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}'
+  vars:
+    migration_labels: "{{ migration_saved.spec.selector.matchLabels }}"
+    migration_selector: "{{ migration_labels | dict2items | map(attribute='key') | zip(migration_labels | dict2items | map(attribute='value')) | map('join', '=') | join(',') }}"
+  register: migration_workload_pods
+  until: migration_workload_pods.stdout_lines | select('equalto', 'Running') | list | length == migration_saved.spec.replicas | int
+  retries: 60
+  delay: 10
+  changed_when: false
+
+- name: "{{ migration_workload.name }} | back, drop the saved spec"
+  ansible.builtin.file:
+    path: "{{ migration_state_dir }}/{{ migration_workload.kind }}-{{ migration_namespace }}-{{ migration_workload.name }}.json"
+    state: absent

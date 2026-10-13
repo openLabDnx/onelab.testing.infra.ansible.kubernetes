@@ -199,7 +199,7 @@ spec:
           labels: { severity: critical }
           annotations:
             summary: Jaeger can't write spans to Badger
-            description: Usually a full disk on the node that holds the jaeger PVC.
+            description: Usually a full jaeger volume; check it in the Longhorn UI.
         - alert: JaegerStorageErrors
           expr: sum by (operation) (rate(jaeger_storage_requests{job="jaeger", namespace="{{ observability_namespace }}", result!="ok"}[5m])) > 0
           for: 15m

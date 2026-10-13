@@ -1,0 +1,132 @@
+---
+- name: Find the primary-site nodes
+  ansible.builtin.set_fact:
+    longhorn_primary_nodes: >-
+      {{ platform_node_sites | dict2items | selectattr('value', 'equalto', platform_primary_site)
+         | map(attribute='key') | select('in', groups['rke2_cluster']) | list }}
+    longhorn_smoke_count: "{{ groups['rke2_cluster'] | length + 1 }}"
+
+# Every node attaches a local-class volume (iSCSI, no multipathd in the way),
+# one pod writes to a replicated volume; then check where Longhorn put the copies.
+- name: Longhorn smoke test
+  block:
+    - name: Remove leftovers of an earlier smoke test
+      ansible.builtin.include_tasks: smoke_cleanup.yaml
+
+    - name: Start the smoke-test pods
+      ansible.builtin.command:
+        cmd: "{{ cluster_kubectl }} apply -f -"
+        stdin: "{{ lookup('ansible.builtin.template', 'smoke-test.yaml.j2') }}"
+      changed_when: false
+
+    - name: Wait for every smoke-test pod to write and read its volume
+      ansible.builtin.command: >-
+        {{ longhorn_kubectl }} get pod -l app.kubernetes.io/name=longhorn-smoke-test
+        -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{"\n"}{end}'
+      register: longhorn_smoke_phases
+      until: >-
+        longhorn_smoke_phases.stdout_lines | select('search', '=Failed$') | list | length > 0
+        or longhorn_smoke_phases.stdout_lines | select('search', '=Succeeded$') | list | length == longhorn_smoke_count | int
+      retries: 60
+      delay: 5
+      changed_when: false
+      failed_when: longhorn_smoke_phases.stdout_lines | select('search', '=Succeeded$') | list | length != longhorn_smoke_count | int
+
+    - name: Read the smoke-test volumes
+      ansible.builtin.command: >-
+        {{ longhorn_kubectl }} get pvc -l app.kubernetes.io/name=longhorn-smoke-test
+        -o jsonpath='{range .items[*]}{.metadata.name}={.spec.volumeName}{"\n"}{end}'
+      register: longhorn_smoke_claims
+      changed_when: false
+
+    - name: Map claims to volumes
+      ansible.builtin.set_fact:
+        longhorn_smoke_volumes: >-
+          {{ dict(longhorn_smoke_claims.stdout_lines | map('split', '=') | list) }}
+
+    - name: Read where Longhorn placed the copies
+      ansible.builtin.command: >-
+        {{ longhorn_kubectl }} get replicas.longhorn.io
+        -o jsonpath='{range .items[*]}{.metadata.labels.longhornvolume}={.spec.nodeID}{"\n"}{end}'
+      register: longhorn_smoke_replicas
+      changed_when: false
+
+    # Longhorn adds the node affinity to a local-class volume once it is attached.
+    - name: Read the node each local-class volume is pinned to
+      ansible.builtin.command: >-
+        {{ cluster_kubectl }} get pv {{ longhorn_smoke_volumes['ansible-smoke-' ~ item] }}
+        -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}'
+      loop: "{{ groups['rke2_cluster'] }}"
+      register: longhorn_smoke_pinned
+      until: longhorn_smoke_pinned.stdout == item
+      retries: 12
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Check where the copies are
+      ansible.builtin.assert:
+        that:
+          # local class: one copy, on the pod's node, and the volume is pinned there
+          - longhorn_local_copies == [item]
+          - (longhorn_smoke_pinned.results | selectattr('item', 'equalto', item) | first).stdout == item
+        fail_msg: >-
+          {{ longhorn_local_class }} volume used on {{ item }}: copies on {{ longhorn_local_copies }},
+          pinned to '{{ (longhorn_smoke_pinned.results | selectattr('item', 'equalto', item) | first).stdout }}'
+        quiet: true
+      loop: "{{ groups['rke2_cluster'] }}"
+      vars:
+        longhorn_local_copies: >-
+          {{ longhorn_smoke_replicas.stdout_lines
+             | select('search', '^' ~ longhorn_smoke_volumes['ansible-smoke-' ~ item] ~ '=')
+             | map('regex_replace', '^[^=]*=', '') | list }}
+
+    - name: Check the replicated volume
+      ansible.builtin.assert:
+        that:
+          - longhorn_replicated_copies | length == longhorn_replicated_replicas | int
+          - longhorn_replicated_copies | unique | length == longhorn_replicated_replicas | int
+          - longhorn_replicated_copies | difference(longhorn_primary_nodes) | length == 0
+        fail_msg: >-
+          {{ longhorn_replicated_class }}: expected {{ longhorn_replicated_replicas }} copies on different
+          {{ platform_primary_site }} nodes ({{ longhorn_primary_nodes | join(', ') }}), found {{ longhorn_replicated_copies }}
+        quiet: true
+      vars:
+        longhorn_replicated_copies: >-
+          {{ longhorn_smoke_replicas.stdout_lines
+             | select('search', '^' ~ longhorn_smoke_volumes['ansible-smoke-replicated'] ~ '=')
+             | map('regex_replace', '^[^=]*=', '') | list }}
+
+  rescue:
+    - name: Show the smoke-test pods
+      ansible.builtin.command: "{{ longhorn_kubectl }} describe pod -l app.kubernetes.io/name=longhorn-smoke-test"
+      register: longhorn_smoke_describe
+      changed_when: false
+      failed_when: false
+
+    - name: Fail the smoke test
+      ansible.builtin.fail:
+        msg: >-
+          Longhorn smoke test failed: {{ ansible_failed_result.msg | default('see above') }}
+          {{ longhorn_smoke_describe.stdout_lines | select('search', 'Warning|Error|Node:|Status:') | list }}
+
+  always:
+    - name: Remove the smoke test
+      ansible.builtin.include_tasks: smoke_cleanup.yaml
+
+- name: Read Longhorn nodes
+  ansible.builtin.command: >-
+    {{ longhorn_kubectl }} get nodes.longhorn.io
+    -o custom-columns=NODE:.metadata.name,TAGS:.spec.tags,SCHEDULABLE:.spec.allowScheduling --no-headers
+  register: longhorn_nodes_table
+  changed_when: false
+
+- name: Display Longhorn summary
+  ansible.builtin.debug:
+    msg:
+      - "Longhorn {{ longhorn_version }}: smoke test OK on {{ groups['rke2_cluster'] | length }} nodes"
+      - "{{ longhorn_replicated_class }}: {{ longhorn_replicated_replicas }} copies on {{ longhorn_primary_nodes | join(' + ') }} (single-copy apps)"
+      - "{{ longhorn_local_class }}: 1 copy on the pod's node, pod pinned there (apps that replicate themselves)"
+      - "longhorn (default class): {{ longhorn_default_class_replicas }} copies on the {{ platform_primary_site }} site, deleted with its claim"
+      - "{{ longhorn_nodes_table.stdout_lines }}"
+      - "UI: https://{{ longhorn_host }}/ (authentik, group {{ platform_admin_group }}) - published by tasks/ui.yaml"

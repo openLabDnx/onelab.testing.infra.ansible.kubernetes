@@ -8,7 +8,9 @@
 kube_prometheus_stack_chart_repo_url: "https://prometheus-community.github.io/helm-charts"
 kube_prometheus_stack_chart_version: "91.7.0"
 
-monitoring_storage_class: "local-path-retain"
+# Prometheus and Grafana run one copy each: two Longhorn copies, one per
+# primary-site node (roles/longhorn), so they restart on the other node with their data.
+monitoring_storage_class: "longhorn-retain"
 prometheus_retention: "15d"
 prometheus_retention_size: "18GB"                  # below the volume size, oldest data dropped first
 prometheus_storage_size: "20Gi"
@@ -49,7 +51,10 @@ monitoring_dashboards:
   - { name: k8s-views-pods, folder: Kubernetes, url: "{{ k8s_dashboards_url }}/k8s-views-pods.json" }
   # pod logs from Loki (namespace / app / container / node / level / search)
   - { name: k8s-pod-logs, folder: Logs, file: dashboards/k8s-pod-logs.json }
+  # Longhorn volumes, nodes, disks, instance managers (and backups once a target exists)
+  - { name: longhorn, folder: Storage, url: "https://grafana.com/api/dashboards/16888/revisions/{{ longhorn_dashboard_revision }}/download" }
 strimzi_dashboards_ref: "1.2.0"
+longhorn_dashboard_revision: 14
 rabbitmq_dashboards_ref: "v4.3.5"
 node_exporter_full_revision: 45
 k8s_dashboards_url: "https://raw.githubusercontent.com/dotdc/grafana-dashboards-kubernetes/v3.0.8/dashboards"

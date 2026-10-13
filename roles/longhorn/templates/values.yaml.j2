@@ -1,0 +1,33 @@
+# Longhorn Helm values (Managed by Ansible)
+persistence:
+  # The chart's "longhorn" class (made by longhorn-manager from a ConfigMap):
+  # the cluster's default class, two copies on the primary site, deleted with
+  # its claim. The roles use the Retain classes from storageclasses.yaml.j2.
+  defaultClass: true
+  defaultClassReplicaCount: {{ longhorn_default_class_replicas }}
+  defaultDataLocality: best-effort
+  reclaimPolicy: Delete
+  defaultNodeSelector:
+    enable: true
+    selector: "{{ platform_primary_site }}"      # Longhorn node tag, see tasks/main.yaml
+
+defaultSettings:
+  {{ longhorn_settings | to_nice_yaml(indent=2) | trim | indent(2) }}
+
+longhornUI:
+  replicas: {{ longhorn_ui_replicas }}
+
+# The managers' API has no login: the chart's internal policies let only
+# Longhorn's own components reach it (validated by Longhorn on RKE2 + Canal).
+# templates/networkpolicies.yaml.j2 adds Traefik -> UI and Prometheus -> metrics.
+networkPolicies:
+  restrictInternalTraffic: true
+
+# Published by this role instead: an IngressRoute behind authentik (tasks/ui.yaml),
+# and the metrics through a ServiceMonitor from roles/monitoring (its CRD does
+# not exist yet when storage is installed).
+ingress:
+  enabled: false
+metrics:
+  serviceMonitor:
+    enabled: false
