@@ -18,6 +18,7 @@ argocd_namespace: "argocd"
 portainer_namespace: "portainer"
 rabbitmq_namespace: "rabbitmq"
 kafka_namespace: "kafka"
+redis_namespace: "redis"
 observability_namespace: "observability"
 longhorn_namespace: "longhorn-system"
 
@@ -67,3 +68,13 @@ pod_cidr: "10.42.0.0/16"
 
 rke2_kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
 cluster_kubectl: "/var/lib/rancher/rke2/bin/kubectl --kubeconfig {{ rke2_kubeconfig_path }}"
+
+# Super-admin web app (roles/superadmin) and its LDAP login through authentik
+# (roles/authentik, tasks/ldap.yaml). The app binds as the user, so only direct
+# members of superadmin_group can sign in.
+superadmin_host: "superadmin.{{ platform_domain }}"
+superadmin_namespace: "super-admin"
+superadmin_group: "super-admins"
+authentik_ldap_base_dn: "dc=authentik,dc=local"     # same as the master cluster
+authentik_ldap_outpost_name: "super-admin-ldap"     # authentik runs it as ak-outpost-<name>
+superadmin_ldap_url: "ldap://ak-outpost-{{ authentik_ldap_outpost_name }}.{{ authentik_namespace }}.svc.cluster.local:389"

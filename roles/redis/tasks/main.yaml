@@ -1,0 +1,57 @@
+---
+- name: Generate and persist the Redis password
+  ansible.builtin.set_fact:
+    redis_password: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/redis_password chars=ascii_letters,digits length=32') }}"
+  no_log: true
+
+- name: Create Redis namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ redis_namespace }}
+  register: redis_ns_apply
+  changed_when: redis_ns_apply.stdout is search('(created|configured)')
+
+# Server-side apply: client-side apply would also copy the password into the
+# last-applied-configuration annotation.
+- name: Store the Redis password in a Secret
+  ansible.builtin.command:
+    cmd: "{{ redis_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: redis-auth
+        namespace: {{ redis_namespace }}
+      type: Opaque
+      stringData:
+        password: "{{ redis_password }}"
+  changed_when: false
+  no_log: true
+
+- name: Deploy Redis
+  ansible.builtin.command:
+    cmd: "{{ redis_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'redis.yaml.j2') }}"
+  register: redis_apply
+  changed_when: redis_apply.stdout is search('(created|configured)')
+
+- name: Wait for Redis rollout
+  ansible.builtin.command: "{{ redis_kubectl }} rollout status deployment/redis --timeout=180s"
+  changed_when: false
+
+- name: Check Redis answers with the password
+  ansible.builtin.command: "{{ redis_kubectl }} exec deploy/redis -- redis-cli ping"
+  register: redis_ping
+  changed_when: false
+  failed_when: redis_ping.stdout | trim != 'PONG'
+
+- name: Show how the apps connect
+  ansible.builtin.debug:
+    msg:
+      - "Redis: redis.{{ redis_namespace }}.svc.cluster.local:6379, open to namespaces: {{ redis_client_namespaces | join(', ') }}"
+      - "Password: secrets/platform/redis_password (Secret redis-auth in {{ redis_namespace }})"
+      - "signal-of-service: REDIS_HOST=redis.{{ redis_namespace }}.svc.cluster.local REDIS_PORT=6379 REDIS_PASSWORD=<that password>"

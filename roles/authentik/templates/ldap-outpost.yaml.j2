@@ -1,0 +1,46 @@
+# LDAP outpost of the super-admin app (Managed by Ansible). authentik owns its
+# Deployment and Service ak-outpost-{{ authentik_ldap_outpost_name }}; these are the objects
+# authentik's ServiceAccount may not create.
+#
+# Only pods in authentik_ldap_client_namespaces may connect (pod ports 3389/6636
+# behind Service ports 389/636), and Prometheus may scrape 9300. Kubelet probes
+# and `kubectl port-forward` (make ldap-tunnel) are not affected.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ak-outpost-{{ authentik_ldap_outpost_name }}
+  namespace: {{ authentik_namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: authentik-outpost-ldap
+      goauthentik.io/outpost-name: {{ authentik_ldap_outpost_name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+{% for ns in authentik_ldap_client_namespaces %}
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ ns }} }
+{% endfor %}
+      ports:
+        - { port: 3389, protocol: TCP }
+        - { port: 6636, protocol: TCP }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ observability_namespace }} }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: prometheus }
+      ports:
+        - { port: 9300, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ak-outpost-{{ authentik_ldap_outpost_name }}
+  namespace: {{ authentik_namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: authentik-outpost-ldap
+      goauthentik.io/outpost-name: {{ authentik_ldap_outpost_name }}

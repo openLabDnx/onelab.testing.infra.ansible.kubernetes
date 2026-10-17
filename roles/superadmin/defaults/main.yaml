@@ -1,0 +1,38 @@
+---
+# Defaults for superadmin role
+# The super-admin console: its static front-end (autofik.dev.front-end.supper-admin)
+# and, below, the Super Admin API (autofik.dev.api.supper.admin), which owns sign-in
+# (LDAP bind to authentik's outpost, roles/authentik tasks/ldap.yaml) and every /api
+# call; the IngressRoute sends /api/ there. CI publishes :testing for every stg-v* tag
+# of either repo; the tag moves, so pods always pull.
+superadmin_image: "docker.io/autofikbyslaap/dev.front-end.supper-admin:testing"
+superadmin_replicas: 2
+superadmin_resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { memory: 256Mi }
+
+# The Super Admin API (autofik.dev.api.supper.admin, Spring): console sign-in over LDAP
+# and the /api/admin/** endpoints. It runs in superadmin_namespace, the namespace the
+# LDAP outpost's NetworkPolicy lets in. CI publishes :testing for every stg-v* tag.
+superadmin_api_service: "super-admin-api"
+superadmin_api_port: 8080
+superadmin_api_image: "docker.io/autofikbyslaap/supper-admin:testing"
+superadmin_api_replicas: 2
+superadmin_api_resources:
+  requests: { cpu: 250m, memory: 768Mi }
+  limits: { memory: 1Gi }
+superadmin_api_java_opts: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+# The API's PostgreSQL + PostGIS (CloudNativePG), primary + synchronous standby on the
+# primary site like authentik's. CloudNativePG generates the app credentials (Secret
+# super-admin-db-app); the PostGIS extension is created at bootstrap (it needs a superuser).
+superadmin_db_cluster: "super-admin-db"
+superadmin_db_instances: 2
+superadmin_db_image: "ghcr.io/cloudnative-pg/postgis:17.11-3.6.4-standard-trixie"
+superadmin_db_size: "10Gi"
+superadmin_db_storage_class: "longhorn-local-retain"
+# Not used for console sign-in (LDAP); only for Authentik bearer tokens, which need an
+# OIDC application for the API in authentik first.
+superadmin_api_authentik_issuer: "https://{{ authentik_host }}/application/o/autofik-admin/"
+superadmin_api_authentik_audience: "autofik-admin"
+
+superadmin_kubectl: "{{ cluster_kubectl }} -n {{ superadmin_namespace }}"

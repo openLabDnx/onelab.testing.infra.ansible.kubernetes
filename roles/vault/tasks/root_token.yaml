@@ -1,0 +1,134 @@
+---
+# Generates a new root token from the unseal key shares (vault operator generate-root),
+# e.g. after the previous one was revoked. The token is written to vault_init_file only.
+- name: Find active Vault pod
+  ansible.builtin.command: >
+    {{ vault_kubectl }} get pods -l {{ vault_server_selector }},vault-active=true
+    -o jsonpath={.items[*].metadata.name}
+  register: vault_active_pod
+  changed_when: false
+  failed_when: vault_active_pod.stdout | length == 0
+
+- name: Set active Vault pod
+  ansible.builtin.set_fact:
+    vault_root_pod: "{{ vault_active_pod.stdout.split() | first }}"
+
+# Vault 2.x requires a token on sys/generate-root (CVE-2026-5807), which we don't have when
+# the root token is gone. enable_unauthenticated_access reopens it for this run only: it is
+# added to the pod's runtime copy of the config and reloaded with SIGHUP, then removed in
+# `always`. A pod restart rebuilds that copy from the ConfigMap, dropping it as well.
+- name: Generate root token with unauthenticated generate-root
+  block:
+    - name: Allow unauthenticated generate-root on {{ vault_root_pod }}
+      ansible.builtin.command:
+        cmd: "{{ vault_kubectl }} exec -i {{ vault_root_pod }} -c vault -- sh -c 'cat >> /tmp/storageconfig.hcl && kill -HUP $(pidof vault)'"
+        stdin: "\nenable_unauthenticated_access = [\"generate-root\"]  # added by make vault-root-token"
+
+    - name: Wait for generate-root to accept unauthenticated requests
+      ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_root_pod }} -c vault -- vault operator generate-root -status -format=json"
+      register: vault_root_status
+      until: vault_root_status.rc == 0
+      retries: 10
+      delay: 2
+      changed_when: false
+
+    # An unfinished attempt (e.g. started by hand) blocks -init; its nonce/OTP are unknown here.
+    - name: Cancel unfinished root generation attempt
+      ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_root_pod }} -c vault -- vault operator generate-root -cancel"
+      when: (vault_root_status.stdout | from_json).started
+
+    - name: Start root generation
+      ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_root_pod }} -c vault -- vault operator generate-root -init -format=json"
+      register: vault_root_init
+      no_log: true
+
+    - name: Record nonce and OTP
+      ansible.builtin.set_fact:
+        vault_root_nonce: "{{ (vault_root_init.stdout | from_json).nonce }}"
+        vault_root_otp: "{{ (vault_root_init.stdout | from_json).otp }}"
+      no_log: true
+
+    # Keys go through stdin so they never appear in process lists or API server exec URLs.
+    - name: Submit unseal key shares
+      ansible.builtin.command:
+        cmd: "{{ vault_kubectl }} exec -i {{ vault_root_pod }} -c vault -- vault operator generate-root -nonce={{ vault_root_nonce }} -format=json -"
+        stdin: "{{ item }}"
+        stdin_add_newline: false
+      loop: "{{ vault_init_data.unseal_keys_b64[:vault_init_data.unseal_threshold] }}"
+      register: vault_root_submit
+      failed_when: false
+      no_log: true
+
+    - name: Report key submission errors
+      ansible.builtin.fail:
+        msg: "{{ vault_root_errors }}"
+      vars:
+        vault_root_errors: "{{ vault_root_submit.results | rejectattr('rc', 'equalto', 0) | map(attribute='stderr') | unique | list }}"
+      when: vault_root_errors | length > 0
+
+    - name: Record encoded root token
+      ansible.builtin.set_fact:
+        vault_root_encoded: "{{ ((vault_root_submit.results | last).stdout | from_json).encoded_token | default('') }}"
+      no_log: true
+
+    - name: Fail when root generation did not complete
+      ansible.builtin.fail:
+        msg: "Root generation did not complete after {{ vault_init_data.unseal_threshold }} key shares. Check `vault operator generate-root -status`."
+      when: vault_root_encoded | default('', true) | length == 0
+
+    - name: Decode root token
+      ansible.builtin.command:
+        cmd: >-
+          {{ vault_kubectl }} exec -i {{ vault_root_pod }} -c vault --
+          sh -c 'read -r OTP; read -r ENCODED; vault operator generate-root -decode="$ENCODED" -otp="$OTP" -format=json'
+        stdin: "{{ vault_root_otp }}\n{{ vault_root_encoded }}"
+      register: vault_root_decode
+      changed_when: false
+      no_log: true
+
+  always:
+    - name: Restore authenticated generate-root on {{ vault_root_pod }}
+      ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_root_pod }} -c vault -- sh -c 'sed -i \"/added by make vault-root-token/d\" /tmp/storageconfig.hcl && kill -HUP $(pidof vault)'"
+
+    - name: Confirm generate-root requires a token again
+      ansible.builtin.command: "{{ vault_kubectl }} exec {{ vault_root_pod }} -c vault -- vault operator generate-root -status"
+      register: vault_root_closed
+      until: vault_root_closed.rc != 0
+      retries: 10
+      delay: 2
+      changed_when: false
+      failed_when: vault_root_closed.rc == 0
+
+- name: Record new root token
+  ansible.builtin.set_fact:
+    vault_new_root_token: "{{ (vault_root_decode.stdout | from_json).token }}"
+  no_log: true
+
+- name: Verify new root token
+  ansible.builtin.command:
+    cmd: >-
+      {{ vault_kubectl }} exec -i {{ vault_root_pod }} -c vault --
+      sh -c 'read -r VAULT_TOKEN; export VAULT_TOKEN; vault token lookup -format=json'
+    stdin: "{{ vault_new_root_token }}"
+  register: vault_root_lookup
+  changed_when: false
+  failed_when: >-
+    vault_root_lookup.rc != 0 or
+    'root' not in (vault_root_lookup.stdout | from_json).data.policies
+  no_log: true
+
+- name: Save new root token to the controller
+  ansible.builtin.copy:
+    content: "{{ vault_init_data | combine({'root_token': vault_new_root_token}) | to_nice_json }}\n"
+    dest: "{{ vault_init_file }}"
+    mode: "0600"
+    backup: yes
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Report new root token location
+  ansible.builtin.debug:
+    msg:
+      - "New root token saved to: {{ vault_init_file }} (root_token)"
+      - "Revoke it with `vault token revoke -self` once you've finished admin work; re-run `make vault-root-token` when you need one again."

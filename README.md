@@ -58,7 +58,7 @@ autofik.infra.testing/
 │   ├── platform_vars/           # Shared hostnames, namespaces, node sites, OIDC client secrets
 │   ├── traefik/                 # RKE2 Traefik HelmChartConfig (no hostPorts) + dashboard behind SSO
 │   ├── cnpg/                    # CloudNativePG operator
-│   ├── authentik/               # PostgreSQL cluster, authentik, SSO blueprint, forward-auth, backups
+│   ├── authentik/               # PostgreSQL cluster, authentik, SSO blueprint, forward-auth, backups, super-admin LDAP outpost
 │   ├── argocd/                  # Argo CD HA + authentik OIDC
 │   ├── portainer/               # Portainer CE + authentik OAuth
 │   ├── cert_manager/            # cert-manager (needed by the RabbitMQ operator)
@@ -68,7 +68,8 @@ autofik.infra.testing/
 │   ├── loki/                    # Loki (logs, 30 days), NetworkPolicy, alerts
 │   ├── jaeger/                  # Jaeger v2 (traces, 7 days, span metrics), UI behind authentik, NetworkPolicy, alerts
 │   ├── alloy/                   # Grafana Alloy on every node: logs + events -> Loki, OTLP -> Jaeger/Loki/Prometheus
-│   └── autoscaling/             # Pod autoscaling (HPA) for the stateless platform apps
+│   ├── autoscaling/             # Pod autoscaling (HPA) for the stateless platform apps
+│   └── superadmin/              # Super-admin web app (LDAP login through authentik), not part of make platform
 ├── playbooks/
 │   ├── 01-prerequisites.yaml    # Node system tuning & preparation
 │   ├── 02-rke2-server.yaml      # Master control-plane deployment
@@ -81,6 +82,7 @@ autofik.infra.testing/
 │   ├── 06-vault.yaml            # Vault HA deploy + init + unseal + verify
 │   ├── vault-unseal.yaml        # Unseal Vault pods after restarts
 │   ├── vault-status.yaml        # Vault pods, seal state, raft peers
+│   ├── vault-root-token.yaml    # New root token from the unseal keys
 │   ├── vault-reset.yaml         # Destroy Vault and its data (asks to confirm)
 │   ├── 07-cloudflare.yaml       # Cloudflare Tunnel + DNS + Access + cloudflared
 │   ├── cloudflare-status.yaml   # Tunnel health, edge certificates, live probes
@@ -92,12 +94,14 @@ autofik.infra.testing/
 │   ├── 10-messaging.yaml        # cert-manager, RabbitMQ, Kafka (tags per part)
 │   ├── 11-monitoring.yaml       # Metrics, logs, traces: Prometheus, Grafana, Loki, Jaeger, Alloy (tags per part)
 │   ├── 12-autoscaling.yaml      # Pod autoscaling (HPA) for authentik, Argo CD, Kafka UI, cloudflared
+│   ├── 13-superadmin.yaml       # Super-admin web app (needs make authentik and the :testing image)
 │   └── reset.yaml               # Complete teardown / uninstallation
 ├── scripts/
 │   ├── check_connectivity.sh   # Diagnostic script for ICMP & SSH auth
 │   ├── setup_ssh_keys.sh       # Key generator & key distribution helper
 │   ├── vault_ui_tunnel.sh      # SSH + port-forward tunnel to the Vault UI
-│   └── apisix_admin_tunnel.sh  # SSH + port-forward tunnel to the APISIX Admin API/UI
+│   ├── apisix_admin_tunnel.sh  # SSH + port-forward tunnel to the APISIX Admin API/UI
+│   └── ldap_tunnel.sh          # SSH + port-forward tunnel to the super-admin LDAP outpost
 ├── secrets/                     # (git-ignored) Vault keys + TLS, Cloudflare tokens, APISIX admin keys
 ├── site.yaml                    # Master orchestration entrypoint
 ├── Makefile                     # Shortcut CLI commands
@@ -262,6 +266,13 @@ On the first run Vault is initialized, and the **unseal keys + root token** are 
 Move that file into a password manager and remove it from your laptop: without 3 of the 5 keys, the data in Vault can't be recovered.
 `make vault-unseal` reads the keys from that path, so put the file back temporarily when you need to unseal.
 Once you've set up real auth methods (userpass/OIDC/Kubernetes), revoke the root token.
+
+### New root token
+If the root token was revoked or lost, generate a new one from 3 of the unseal keys (needs `secrets/vault/vault-init.json`):
+```bash
+make vault-root-token   # writes the new token to root_token in vault-init.json; never prints it
+```
+Vault 2.x needs a token on `sys/generate-root` (CVE-2026-5807), so the playbook adds `enable_unauthenticated_access = ["generate-root"]` to the active pod's runtime config for the run and removes it afterwards.
 
 ### After any restart: unseal
 Vault pods come back **sealed** after a node reboot, eviction or upgrade. The cluster keeps serving while 2 of 3 pods are unsealed. To unseal the restarted pod:
@@ -447,6 +458,7 @@ make traefik     # Traefik settings + dashboard
 make authentik   # PostgreSQL + authentik + SSO blueprint + backups
 make argocd      # Argo CD HA + SSO
 make portainer   # Portainer + SSO
+make ldap-tunnel # laptop tunnel to the super-admin LDAP outpost (ldap://127.0.0.1:3389)
 ```
 
 ### What "production" means here
@@ -464,6 +476,42 @@ master and worker2 share a data centre (~1 ms). **worker1 is ~160 ms away.** Nod
 2. Check SSO into Argo CD, then set `argocd_admin_enabled: false` in `roles/argocd/defaults/main.yaml` and run `make argocd`.
 3. Copy the latest authentik backup off the cluster from time to time:
    `kubectl -n authentik exec <pod with the PVC> -- ls /backups` (or restore with `pg_restore`).
+
+### Super-admin LDAP (authentik LDAP outpost)
+The super-admin console (`autofik.dev.front-end.supper-admin`) keeps its own sign-in page; the **Super Admin API** (`autofik.dev.api.supper.admin`) checks the password over LDAP: it binds to authentik **as the user**, then reads the user's own entry. `make authentik` sets this up from the blueprint and `roles/authentik/tasks/ldap.yaml`:
+
+| Item | Setting |
+| :--- | :--- |
+| Address | `ldap://ak-outpost-super-admin-ldap.authentik.svc.cluster.local:389`, **in-cluster only** (no Cloudflare route). NetworkPolicy: only namespace `super-admin` (`authentik_ldap_client_namespaces`), where the Super Admin API runs, plus Prometheus on 9300 |
+| Outpost | run by authentik itself (Kubernetes integration), 2 pods on `eu` next to authentik, PDB `minAvailable: 1` |
+| DNs | base `dc=authentik,dc=local` (same as the master cluster); users `cn=<username>,ou=users,dc=authentik,dc=local` |
+| Who can sign in | **direct** members of the authentik group `super-admins`. The LDAP application is bound to that group, and the app checks `memberOf` again. `akadmin` is not a member |
+| MFA | the bind runs `default-authentication-flow`. People with a TOTP or static code type it in the app's "Authenticator code" field (the app sends `password;code`). WebAuthn-only accounts cannot bind |
+| Accounts | no search account and no LDAP password stored anywhere: a user without directory-search rights sees only their own entry |
+
+Add people in the authentik UI (Directory → Groups → `super-admins` → Users), or list usernames in `superadmin_members` (`roles/authentik/defaults/main.yaml`): every `make authentik` **adds** them and never removes anyone; users that do not exist yet are skipped with a note.
+
+Run the console on a laptop against this cluster:
+```bash
+make ldap-tunnel     # keep it open: ldap://127.0.0.1:3389 -> the outpost (reconnects by itself)
+# Super Admin API repo: LDAP_URL=ldap://127.0.0.1:3389 ./mvnw spring-boot:run   (port 8080)
+# front-end repo:       npm run dev   -> http://localhost:3008 (/api proxied to :8080)
+```
+
+Things to know:
+- Plain LDAP inside the cluster is unencrypted between nodes, which use their public IPs; the outpost and the app both run on `eu`. LDAPS needs a certificate on the provider whose SAN is the Service name (follow-up).
+- Removing someone from `super-admins` takes effect at their next sign-in (API sessions last 8 h). To sign everybody out, rotate the API's session secret (see below).
+- `memberOf` lists direct groups only, so add people to `super-admins` itself, not to a child group.
+
+### Super-admin app (`make superadmin`)
+`playbooks/13-superadmin.yaml` deploys the console's static front-end (image `autofikbyslaap/dev.front-end.supper-admin:testing`, published by CI for every `stg-v*` tag) at **https://superadmin.testing.autofik.com**, 2 pods on `eu`, behind Traefik with no forward-auth. `/api/` on the same host goes to the **Super Admin API** (`autofik.dev.api.supper.admin`), which does the LDAP sign-in. It needs `make authentik` first.
+
+| Setting | Value |
+| :--- | :--- |
+| `/api/` route | Service `super-admin-api:8080` in namespace `super-admin` (`superadmin_api_service`/`_port`). The API is deployed separately, in that namespace, because the LDAP outpost only accepts it |
+| API's LDAP settings | `LDAP_URL=ldap://ak-outpost-super-admin-ldap.authentik.svc.cluster.local:389`, `LDAP_BASE_DN=dc=authentik,dc=local`, `LDAP_SUPERADMIN_GROUP=super-admins`, `ADMIN_SESSION_COOKIE_SECURE=true` |
+| API's session secret | `ADMIN_SESSION_SECRET` in Secret `super-admin-session` (created here; local copy `secrets/platform/superadmin_session_secret`) |
+| Sign everybody out | `kubectl -n super-admin delete secret super-admin-session`, delete `secrets/platform/superadmin_session_secret`, `make superadmin`, then restart the API. If only the local file is lost, the run stops instead of rotating it |
 
 ---
 
@@ -485,6 +533,7 @@ Both run as **3-member clusters, one member per server**, so losing any one serv
 make messaging   # cert-manager + RabbitMQ + Kafka, each ends with a smoke test (safe to re-run)
 make rabbitmq    # RabbitMQ only
 make kafka       # Kafka only
+make redis       # Redis for the apps only
 ```
 
 ### Connecting the apps
@@ -493,6 +542,7 @@ make kafka       # Kafka only
   `spring.kafka.properties.security.protocol=SASL_PLAINTEXT`, `sasl.mechanism=SCRAM-SHA-512`, `sasl.jaas.config=<from Secret signal-of-service>`. Use `acks=all` (the Spring default) with idempotence on.
 - **Kafka (Go, sos-gateway):** `KAFKA_BROKERS=kafka-kafka-bootstrap.kafka.svc:9092`, `KAFKA_GROUP_PREFIX=sos-gateway`, SCRAM-SHA-512 with the `sos-gateway` user.
 - For encryption between nodes, use port **9093** (SASL_SSL) and trust the CA in Secret `kafka-cluster-ca-cert`.
+- **Redis (signal-of-service):** `REDIS_HOST=redis.redis.svc.cluster.local`, `REDIS_PORT=6379`, `REDIS_PASSWORD=<secrets/platform/redis_password>`. One instance, **no persistence** (a restart empties it): only for data the app can rebuild. Only namespaces in `redis_client_namespaces` (`roles/redis/defaults/main.yaml`, default `sos`) can connect.
 - Users, topics and ACLs live in `roles/rabbitmq/defaults/main.yaml` and `roles/kafka/defaults/main.yaml`. Add an app there and re-run.
 
 ### Things to know

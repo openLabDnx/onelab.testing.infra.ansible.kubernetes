@@ -1,0 +1,55 @@
+---
+# LDAP for the super-admin app. The blueprint declares the provider, the
+# application (only superadmin_group may bind) and the outpost; authentik then
+# creates the outpost's Deployment and Service itself.
+- name: Restrict and protect the LDAP outpost
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'ldap-outpost.yaml.j2') }}"
+  register: authentik_ldap_apply
+  changed_when: authentik_ldap_apply.stdout is search('(created|configured)')
+
+# authentik reconciles outposts in the background after the blueprint is applied.
+- name: Wait for authentik to create the LDAP outpost
+  ansible.builtin.command: "{{ authentik_kubectl }} get deployment/ak-outpost-{{ authentik_ldap_outpost_name }} -o name"
+  register: authentik_ldap_deployment
+  until: authentik_ldap_deployment.rc == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Wait for the LDAP outpost rollout
+  ansible.builtin.command: "{{ authentik_kubectl }} rollout status deployment/ak-outpost-{{ authentik_ldap_outpost_name }} --timeout=300s"
+  changed_when: false
+
+# Additive on purpose: people added in the UI stay members.
+- name: Add superadmin_members to the super-admins group
+  ansible.builtin.command:
+    cmd: "{{ authentik_kubectl }} exec -i deploy/authentik-worker -c worker -- ak shell"
+    stdin: |
+      from authentik.core.models import Group, User
+      wanted = {{ superadmin_members | to_json }}
+      group = Group.objects.get(name={{ superadmin_group | to_json }})
+      users = list(User.objects.filter(username__in=wanted))
+      new = [user for user in users if not group.users.filter(pk=user.pk).exists()]
+      group.users.add(*new)
+      missing = sorted(set(wanted) - {user.username for user in users})
+      print("SUPERADMINS ADDED=%d MISSING=%s" % (len(new), ",".join(missing) or "-"))
+  register: superadmin_members_add
+  until: superadmin_members_add.rc == 0 and superadmin_members_add.stdout is search('SUPERADMINS ADDED=')
+  retries: 5
+  delay: 10
+  changed_when: superadmin_members_add.stdout is search('SUPERADMINS ADDED=[1-9]')
+  when: superadmin_members | length > 0
+
+- name: Show super-admins that do not exist in authentik yet
+  ansible.builtin.debug:
+    msg: >-
+      Not in authentik yet, so not added:
+      {{ superadmin_members_add.stdout | regex_search('MISSING=(\S+)', '\1') | first }}.
+      Create them at https://{{ authentik_host }}/ and re-run make authentik
+      (or add them to {{ superadmin_group }} in the UI).
+  when:
+    - superadmin_members | length > 0
+    - superadmin_members_add.stdout is defined
+    - superadmin_members_add.stdout is not search('MISSING=-')

@@ -28,3 +28,20 @@ authentik_backup_size: "10Gi"
 authentik_backup_storage_class: "longhorn-retain"
 
 authentik_kubectl: "{{ cluster_kubectl }} -n {{ authentik_namespace }}"
+
+# LDAP for the super-admin app (tasks/ldap.yaml + blueprint): an LDAP provider whose
+# application only superadmin_group may bind to, served by an outpost that authentik
+# runs itself in this namespace (Deployment/Service ak-outpost-<name>). The app binds
+# as the user and reads its own entry: no search account, no stored LDAP password.
+authentik_ldap_enabled: true
+authentik_ldap_outpost_replicas: 2
+authentik_ldap_outpost_resources:
+  requests: { cpu: 20m, memory: 64Mi }
+  limits: { memory: 256Mi }
+# Namespaces whose pods may connect to the outpost (NetworkPolicy).
+authentik_ldap_client_namespaces:
+  - "{{ superadmin_namespace }}"
+# Usernames ADDED to superadmin_group on every run. Nobody is ever removed and
+# users that do not exist yet are skipped; manage everyone else in the UI.
+superadmin_members:
+  - reaksamai

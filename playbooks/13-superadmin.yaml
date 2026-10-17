@@ -1,0 +1,21 @@
+---
+# Super-admin web app with LDAP login. Needs `make authentik` first (it creates the
+# super-admins group and the LDAP outpost) and the :testing image from CI.
+- name: Label nodes by site
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [always]
+  tasks:
+    - name: Label nodes
+      ansible.builtin.include_role:
+        name: platform_vars
+        tasks_from: label_nodes.yaml
+
+- name: Super-admin app
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [superadmin]
+  roles:
+    - superadmin

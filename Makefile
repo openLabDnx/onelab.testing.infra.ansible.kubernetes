@@ -1,10 +1,10 @@
 .PHONY: help check setup-ssh ping prep master workers deploy verify reset nodes pods \
 	storage longhorn longhorn-status storage-migrate local-path-remove \
-	vault vault-unseal vault-status vault-ui vault-reset \
+	vault vault-unseal vault-status vault-root-token vault-ui vault-reset \
 	cloudflare cloudflare-connector cloudflare-status cloudflare-reset \
 	apisix apisix-status apisix-admin apisix-reset \
-	platform traefik authentik argocd portainer messaging rabbitmq kafka monitoring \
-	loki jaeger alloy autoscaling
+	platform traefik authentik ldap-tunnel argocd portainer messaging rabbitmq kafka redis monitoring \
+	loki jaeger alloy autoscaling superadmin
 
 KUBECONFIG ?= kubeconfig/autofik-rke2.yaml
 
@@ -32,6 +32,7 @@ help:
 	@echo "make vault       : Deploy Vault HA (storage -> helm -> init -> unseal)"
 	@echo "make vault-unseal: Unseal Vault pods after a restart"
 	@echo "make vault-status: Show Vault pods, seal state and raft peers"
+	@echo "make vault-root-token : New root token from the unseal keys (saved to vault-init.json)"
 	@echo "make vault-ui    : SSH tunnel to the Vault UI at https://127.0.0.1:8200"
 	@echo "make vault-reset : DESTROY Vault and all of its data"
 	@echo "-----------------------------------------------------------------"
@@ -48,17 +49,21 @@ help:
 	@echo "make platform   : Traefik + authentik (SSO) + Argo CD + Portainer, in order"
 	@echo "make traefik    : Traefik settings (no hostPorts) + dashboard behind SSO"
 	@echo "make authentik  : PostgreSQL (CloudNativePG x3) + authentik + SSO blueprint"
+	@echo "make ldap-tunnel: SSH tunnel to the super-admin LDAP outpost at ldap://127.0.0.1:3389"
 	@echo "make argocd     : Argo CD HA with authentik SSO"
 	@echo "make portainer  : Portainer with authentik SSO"
 	@echo "-----------------------------------------------------------------"
 	@echo "make messaging  : cert-manager + RabbitMQ + Kafka (needs make platform)"
 	@echo "make rabbitmq   : RabbitMQ 3-node cluster, app users, UI behind SSO"
 	@echo "make kafka      : Kafka (Strimzi, KRaft x3), topics, users, Kafka UI behind SSO"
+	@echo "make redis      : Redis for the apps (one instance, no persistence, password)"
 	@echo "make monitoring : Metrics + logs + traces: Prometheus, Grafana (SSO), Loki, Jaeger, Alloy"
 	@echo "make loki       : Loki (logs, 30 days) only"
 	@echo "make jaeger     : Jaeger (traces, UI behind SSO) only"
 	@echo "make alloy      : Alloy (log/trace collection) + end-to-end logs/traces check"
 	@echo "make autoscaling: Pod autoscaling (HPA) for authentik, Argo CD, Kafka UI, cloudflared"
+	@echo "-----------------------------------------------------------------"
+	@echo "make superadmin : Super-admin app (LDAP login) at https://superadmin.testing.autofik.com"
 	@echo "================================================================="
 
 check:
@@ -111,6 +116,9 @@ vault-unseal:
 vault-status:
 	ansible-playbook playbooks/vault-status.yaml
 
+vault-root-token:
+	ansible-playbook playbooks/vault-root-token.yaml
+
 vault-ui:
 	@./scripts/vault_ui_tunnel.sh
 
@@ -150,6 +158,9 @@ traefik:
 authentik:
 	ansible-playbook playbooks/05-storage.yaml playbooks/09-platform.yaml --tags authentik
 
+ldap-tunnel:
+	@./scripts/ldap_tunnel.sh
+
 argocd:
 	ansible-playbook playbooks/09-platform.yaml --tags argocd
 
@@ -165,6 +176,9 @@ rabbitmq:
 kafka:
 	ansible-playbook playbooks/10-messaging.yaml --tags kafka
 
+redis:
+	ansible-playbook playbooks/10-messaging.yaml --tags redis
+
 monitoring:
 	ansible-playbook playbooks/11-monitoring.yaml
 
@@ -179,6 +193,9 @@ alloy:
 
 autoscaling:
 	ansible-playbook playbooks/12-autoscaling.yaml
+
+superadmin:
+	ansible-playbook playbooks/13-superadmin.yaml
 
 nodes:
 	@if [ -f "$(KUBECONFIG)" ]; then \

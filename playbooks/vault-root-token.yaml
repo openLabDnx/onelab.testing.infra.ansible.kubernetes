@@ -1,0 +1,17 @@
+---
+# Run when the root token was revoked or lost: builds a new one from the unseal key
+# shares in vault-init.json and writes it back to that file.
+- name: Generate a new HashiCorp Vault root token
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Load unseal keys
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: load_keys.yaml
+
+    - name: Generate root token
+      ansible.builtin.include_role:
+        name: vault
+        tasks_from: root_token.yaml

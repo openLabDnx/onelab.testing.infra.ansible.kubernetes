@@ -1,0 +1,131 @@
+---
+- name: Create super-admin namespace
+  ansible.builtin.command:
+    cmd: "{{ cluster_kubectl }} apply -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ superadmin_namespace }}
+  register: superadmin_ns_apply
+  changed_when: superadmin_ns_apply.stdout is search('(created|configured)')
+
+# A lost local file would otherwise generate a new secret and sign everybody out.
+- name: Check for the local session secret file
+  ansible.builtin.stat:
+    path: "{{ platform_secrets_dir }}/superadmin_session_secret"
+  register: superadmin_secret_file
+  delegate_to: localhost
+  become: false
+
+- name: Check for the session Secret
+  ansible.builtin.command: "{{ superadmin_kubectl }} get secret super-admin-session -o name"
+  register: superadmin_secret_live
+  failed_when: false
+  changed_when: false
+
+- name: Stop instead of rotating the session secret by accident
+  ansible.builtin.fail:
+    msg: >-
+      {{ platform_secrets_dir }}/superadmin_session_secret is missing but Secret
+      super-admin-session exists. Restore the file, or to sign everybody out on purpose:
+      {{ superadmin_kubectl }} delete secret super-admin-session, then re-run make superadmin.
+  when: not superadmin_secret_file.stat.exists and superadmin_secret_live.rc == 0
+
+- name: Generate and persist the session secret
+  ansible.builtin.set_fact:
+    superadmin_session_secret: "{{ lookup('ansible.builtin.password', platform_secrets_dir ~ '/superadmin_session_secret chars=ascii_letters,digits length=64') }}"
+  no_log: true
+
+# Server-side apply: client-side apply would also copy the secret into the
+# last-applied-configuration annotation.
+- name: Store the session secret in a Secret
+  ansible.builtin.command:
+    cmd: "{{ superadmin_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: super-admin-session
+        namespace: {{ superadmin_namespace }}
+        labels: { app.kubernetes.io/managed-by: ansible-superadmin }
+      type: Opaque
+      stringData:
+        ADMIN_SESSION_SECRET: "{{ superadmin_session_secret }}"
+  changed_when: false
+  no_log: true
+
+# --- Super Admin API ------------------------------------------------------------
+- name: Create the API's PostgreSQL cluster
+  ansible.builtin.command:
+    cmd: "{{ superadmin_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'superadmin-db.yaml.j2') }}"
+  register: superadmin_db_apply
+  changed_when: superadmin_db_apply.stdout is search('(created|configured)')
+
+- name: Wait for the API's PostgreSQL cluster
+  ansible.builtin.command: "{{ superadmin_kubectl }} wait cluster/{{ superadmin_db_cluster }} --for=condition=Ready --timeout=900s"
+  changed_when: false
+
+- name: Check that make kafka created the API's Kafka user
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ kafka_namespace }} get secret {{ superadmin_api_service }} -o name"
+  register: superadmin_api_kafka_user
+  changed_when: false
+  failed_when: false
+
+- name: Stop when the API's Kafka user is missing
+  ansible.builtin.fail:
+    msg: >-
+      Secret {{ superadmin_api_service }} does not exist in {{ kafka_namespace }}:
+      run make kafka first (user {{ superadmin_api_service }} in roles/kafka/defaults).
+  when: superadmin_api_kafka_user.rc != 0
+
+- name: Read the API's Kafka credentials
+  # single quotes: the command module's shlex split would eat the backslashes
+  ansible.builtin.command: "{{ cluster_kubectl }} -n {{ kafka_namespace }} get secret {{ superadmin_api_service }} -o 'jsonpath={.data.sasl\\.jaas\\.config}'"
+  register: superadmin_api_jaas
+  changed_when: false
+  no_log: true
+
+# Strimzi keeps the user's Secret in the kafka namespace; pods read Secrets of their own.
+- name: Give the API its Kafka credentials
+  ansible.builtin.command:
+    cmd: "{{ superadmin_kubectl }} apply --server-side --force-conflicts --field-manager=ansible -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: {{ superadmin_api_service }}-kafka
+        namespace: {{ superadmin_namespace }}
+        labels: { app.kubernetes.io/managed-by: ansible-superadmin }
+      type: Opaque
+      stringData:
+        sasl.jaas.config: {{ superadmin_api_jaas.stdout | b64decode | to_json }}
+  changed_when: false
+  no_log: true
+
+- name: Deploy the Super Admin API
+  ansible.builtin.command:
+    cmd: "{{ superadmin_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'superadmin-api.yaml.j2') }}"
+  register: superadmin_api_apply
+  changed_when: superadmin_api_apply.stdout is search('(created|configured)')
+
+- name: Wait for the Super Admin API rollout
+  ansible.builtin.command: "{{ superadmin_kubectl }} rollout status deployment/{{ superadmin_api_service }} --timeout=900s"
+  changed_when: false
+
+# --- front-end --------------------------------------------------------------------
+- name: Deploy the super-admin app
+  ansible.builtin.command:
+    cmd: "{{ superadmin_kubectl }} apply -f -"
+    stdin: "{{ lookup('ansible.builtin.template', 'superadmin.yaml.j2') }}"
+  register: superadmin_apply
+  changed_when: superadmin_apply.stdout is search('(created|configured)')
+
+- name: Wait for the super-admin rollout
+  ansible.builtin.command: "{{ superadmin_kubectl }} rollout status deployment/super-admin --timeout=300s"
+  changed_when: false
+
+- name: Verify the super-admin app
+  ansible.builtin.import_tasks: verify.yaml

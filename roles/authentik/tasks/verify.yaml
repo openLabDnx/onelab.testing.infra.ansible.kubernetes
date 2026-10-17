@@ -34,3 +34,23 @@
       - "database:   {{ authentik_db_status.stdout }}"
       - "backups:    CronJob authentik-db-backup ({{ authentik_backup_schedule }} UTC, {{ authentik_backup_retention_days }} days) on PVC authentik-db-backups"
       - "admins:     members of the '{{ platform_admin_group }}' group get into Argo CD, Portainer and the Traefik dashboard"
+
+- name: Show LDAP outpost replicas
+  ansible.builtin.command: >
+    {{ authentik_kubectl }} get deployment ak-outpost-{{ authentik_ldap_outpost_name }}
+    -o jsonpath='{.status.readyReplicas}/{.spec.replicas}'
+  register: authentik_ldap_status
+  changed_when: false
+  failed_when: >-
+    authentik_ldap_status.rc != 0 or
+    authentik_ldap_status.stdout.split('/')[0] != authentik_ldap_status.stdout.split('/')[1]
+  when: authentik_ldap_enabled
+
+- name: Display super-admin LDAP summary
+  ansible.builtin.debug:
+    msg:
+      - "LDAP:       {{ superadmin_ldap_url }} (in-cluster only; namespaces {{ authentik_ldap_client_namespaces | join(', ') }}), {{ authentik_ldap_status.stdout }} ready"
+      - "bind DN:    cn=<username>,ou=users,{{ authentik_ldap_base_dn }}"
+      - "sign-in:    direct members of cn={{ superadmin_group }},ou=groups,{{ authentik_ldap_base_dn }}; add people at https://{{ authentik_host }}/ (Directory > Groups) or in superadmin_members"
+      - "laptop:     make ldap-tunnel, then LDAP_URL=ldap://127.0.0.1:3389 for the super-admin app"
+  when: authentik_ldap_enabled

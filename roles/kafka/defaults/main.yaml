@@ -36,6 +36,15 @@ kafka_topics:
   - sos.media.uploaded
   - sos.notification
   - sos.dlq
+  # Super Admin API (autofik.dev.api.supper.admin, KafkaTopics): domain events it
+  # publishes; it declares sos.events at startup and only checks that it exists.
+  - sos.events
+  - alert.events
+  - payment.events
+  - token.events
+  - wallet.events
+  - verification.events
+  - dispute.events
 
 # One SCRAM user per app, ACLs limited to its topics and consumer groups.
 kafka_users:
@@ -49,6 +58,15 @@ kafka_users:
       - { resource: { type: topic, name: "sos.", patternType: prefix }, operations: [Read, Describe] }
       - { resource: { type: topic, name: "mechanic.", patternType: prefix }, operations: [Read, Describe] }
       - { resource: { type: group, name: "sos-gateway", patternType: prefix }, operations: [Read, Describe] }
+  - name: super-admin-api                           # Super Admin API: publishes its *.events topics
+    acls:
+      - { resource: { type: topic, name: sos.events, patternType: literal }, operations: [Describe, Write] }
+      - { resource: { type: topic, name: alert.events, patternType: literal }, operations: [Describe, Write] }
+      - { resource: { type: topic, name: payment.events, patternType: literal }, operations: [Describe, Write] }
+      - { resource: { type: topic, name: token.events, patternType: literal }, operations: [Describe, Write] }
+      - { resource: { type: topic, name: wallet.events, patternType: literal }, operations: [Describe, Write] }
+      - { resource: { type: topic, name: verification.events, patternType: literal }, operations: [Describe, Write] }
+      - { resource: { type: topic, name: dispute.events, patternType: literal }, operations: [Describe, Write] }
   - name: kafka-ui                                  # read-only browser
     acls:
       - { resource: { type: topic, name: "*", patternType: literal }, operations: [Read, Describe, DescribeConfigs] }

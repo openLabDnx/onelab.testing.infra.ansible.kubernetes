@@ -110,6 +110,10 @@
 - name: Apply the platform blueprint
   ansible.builtin.import_tasks: blueprint_apply.yaml
 
+- name: LDAP for the super-admin app
+  ansible.builtin.import_tasks: ldap.yaml
+  when: authentik_ldap_enabled
+
 - name: Create Traefik forward-auth middleware
   ansible.builtin.command:
     cmd: "{{ authentik_kubectl }} apply -f -"

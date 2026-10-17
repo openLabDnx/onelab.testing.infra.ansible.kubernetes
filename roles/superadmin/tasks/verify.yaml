@@ -1,0 +1,44 @@
+---
+# Checks through Cloudflare; skip with --skip-tags public.
+- name: The super-admin app answers through Cloudflare
+  ansible.builtin.uri:
+    url: "https://{{ superadmin_host }}/healthz"
+    return_content: true
+  register: superadmin_public
+  until: superadmin_public.status == 200 and superadmin_public.content == 'ok'
+  retries: 12
+  delay: 10
+  delegate_to: localhost
+  become: false
+  tags: [public]
+
+- name: The API answers on the same host (no session yet)
+  ansible.builtin.uri:
+    url: "https://{{ superadmin_host }}/api/admin/auth/me"
+    status_code: [401]
+    return_content: true
+  register: superadmin_api_public
+  until: >-
+    superadmin_api_public.status == 401 and
+    (superadmin_api_public.json.type | default('')) is search('/problems/session-required$')
+  retries: 12
+  delay: 10
+  delegate_to: localhost
+  become: false
+  tags: [public]
+
+- name: Show super-admin pods
+  ansible.builtin.command: >
+    {{ superadmin_kubectl }} get pods -l 'app.kubernetes.io/name in (super-admin,{{ superadmin_api_service }})'
+    -o custom-columns=POD:.metadata.name,READY:.status.containerStatuses[0].ready,NODE:.spec.nodeName --no-headers
+  register: superadmin_pods
+  changed_when: false
+
+- name: Display super-admin summary
+  ansible.builtin.debug:
+    msg:
+      - "super-admin: https://{{ superadmin_host }}/  ({{ superadmin_image }})"
+      - "pods:        {{ superadmin_pods.stdout_lines | join('; ') }}"
+      - "api:         /api/ -> {{ superadmin_api_service }}:{{ superadmin_api_port }} ({{ superadmin_api_image }}), PostgreSQL {{ superadmin_db_cluster }}, Kafka user {{ superadmin_api_service }}"
+      - "sign-in:     the API binds to {{ superadmin_ldap_url }}; members of '{{ superadmin_group }}' only"
+      - "sessions:    the API signs them with ADMIN_SESSION_SECRET (Secret super-admin-session, {{ platform_secrets_dir }}/superadmin_session_secret)"

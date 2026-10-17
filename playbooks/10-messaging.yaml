@@ -1,7 +1,7 @@
 ---
 # Messaging: RabbitMQ (3-node cluster, quorum queues) and Kafka (Strimzi, 3 KRaft
 # nodes), with their admin UIs behind authentik. Needs 09-platform first
-# (authentik, Traefik). Run one part with --tags rabbitmq / kafka.
+# (authentik, Traefik). Run one part with --tags rabbitmq / kafka / redis.
 - name: Label nodes by site
   hosts: "{{ groups['rke2_servers'][0] }}"
   become: yes
@@ -47,3 +47,12 @@
   tags: [kafka]
   roles:
     - kafka
+
+# Short-lived app data (signal-of-service: location pub/sub, locks, ETA cache).
+- name: Redis
+  hosts: "{{ groups['rke2_servers'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: [redis]
+  roles:
+    - redis

@@ -1,0 +1,128 @@
+# Super Admin API (Managed by Ansible)
+# https://{{ superadmin_host }}/api/ -> Traefik -> {{ superadmin_api_service }}:{{ superadmin_api_port }} -> pods :8080.
+# Signs people in against {{ superadmin_ldap_url }}; data in PostgreSQL {{ superadmin_db_cluster }}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ superadmin_api_service }}
+  namespace: {{ superadmin_namespace }}
+  labels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+spec:
+  replicas: {{ superadmin_api_replicas }}
+  selector:
+    matchLabels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+      annotations:
+        # a new session secret rolls the pods, which read it only at start
+        autofik.com/session-secret-sha256: "{{ superadmin_session_secret | hash('sha256') }}"
+    spec:
+      nodeSelector: {{ platform_primary_site_selector | to_json }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001                             # the image's user is a name, so pin a uid
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: {{ superadmin_api_image }}
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: grpc, containerPort: 9090 }
+          env:
+            - { name: SERVER_PORT, value: "8080" }
+            - { name: GRPC_PORT, value: "9090" }
+            - { name: JAVA_TOOL_OPTIONS, value: "{{ superadmin_api_java_opts }}" }
+            - { name: DB_HOST, value: "{{ superadmin_db_cluster }}-rw" }
+            - { name: DB_PORT, value: "5432" }
+            - name: DB_NAME
+              valueFrom: { secretKeyRef: { name: {{ superadmin_db_cluster }}-app, key: dbname } }
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: {{ superadmin_db_cluster }}-app, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ superadmin_db_cluster }}-app, key: password } }
+            - { name: KAFKA_BOOTSTRAP_SERVERS, value: "{{ kafka_cluster_name | default('kafka') }}-kafka-bootstrap.{{ kafka_namespace }}.svc:9092" }
+            - { name: SPRING_KAFKA_PROPERTIES_SECURITY_PROTOCOL, value: SASL_PLAINTEXT }
+            - { name: SPRING_KAFKA_PROPERTIES_SASL_MECHANISM, value: SCRAM-SHA-512 }
+            - name: SPRING_KAFKA_PROPERTIES_SASL_JAAS_CONFIG
+              valueFrom: { secretKeyRef: { name: {{ superadmin_api_service }}-kafka, key: sasl.jaas.config } }
+            - { name: AUTHENTIK_ISSUER_URI, value: "{{ superadmin_api_authentik_issuer }}" }
+            - { name: AUTOFIK_ADMIN_AUDIENCE, value: "{{ superadmin_api_authentik_audience }}" }
+            - { name: LDAP_URL, value: "{{ superadmin_ldap_url }}" }
+            - { name: LDAP_BASE_DN, value: "{{ authentik_ldap_base_dn }}" }
+            - { name: LDAP_SUPERADMIN_GROUP, value: "{{ superadmin_group }}" }
+            # TLS ends at Cloudflare, but browsers are on https: keep the cookie Secure
+            - { name: ADMIN_SESSION_COOKIE_SECURE, value: "true" }
+            - name: ADMIN_SESSION_SECRET
+              valueFrom: { secretKeyRef: { name: super-admin-session, key: ADMIN_SESSION_SECRET } }
+          # Spring Boot enables the liveness/readiness groups when it runs in Kubernetes.
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 10
+            failureThreshold: 36                     # Flyway + context start can take minutes on 250m CPU
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds: 10
+          resources: {{ superadmin_api_resources | to_json }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }        # Tomcat's work directory
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ superadmin_api_service }}
+  namespace: {{ superadmin_namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ superadmin_api_service }}
+  namespace: {{ superadmin_namespace }}
+  labels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+spec:
+  selector: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+  ports:
+    - { name: http, port: {{ superadmin_api_port }}, targetPort: http }
+---
+# Only Traefik reaches the API (the /api/ route). The probes come from the pod's own node.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ superadmin_api_service }}
+  namespace: {{ superadmin_namespace }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: {{ superadmin_api_service }} }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: rke2-traefik }
+      ports:
+        - { port: 8080, protocol: TCP }

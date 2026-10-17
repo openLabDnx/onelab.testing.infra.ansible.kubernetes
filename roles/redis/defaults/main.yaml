@@ -1,0 +1,17 @@
+---
+# Defaults for redis role
+# One Redis for the apps, no persistence. signal-of-service keeps only short-lived
+# data in it (mechanic location pub/sub, locks of a few seconds, an ETA cache of
+# minutes): a restart empties it and the app rebuilds it, nothing that Postgres or
+# Kafka does not also hold is lost. Not for anything that must survive a restart.
+redis_image: "redis:7.4.11-alpine"
+redis_maxmemory: "256mb"                           # oldest keys are evicted beyond this (allkeys-lru)
+redis_resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 384Mi }                        # maxmemory plus Redis's own overhead
+
+# Namespaces whose pods may connect (NetworkPolicy). Everyone else is refused.
+redis_client_namespaces:
+  - sos
+
+redis_kubectl: "{{ cluster_kubectl }} -n {{ redis_namespace }}"

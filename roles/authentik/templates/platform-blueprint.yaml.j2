@@ -4,7 +4,7 @@ version: 1
 metadata:
   name: autofik-platform
   labels:
-    blueprints.goauthentik.io/description: "SSO for Argo CD, Portainer and the Traefik dashboard"
+    blueprints.goauthentik.io/description: "SSO for Argo CD, Portainer and the Traefik dashboard; LDAP for the super-admin app"
 entries:
   # --- admins -------------------------------------------------------------
   - model: authentik_core.group
@@ -163,3 +163,78 @@ entries:
 {% endfor %}
       config:
         authentik_host: https://{{ authentik_host }}
+{% if authentik_ldap_enabled %}
+
+  # --- super-admin web app (LDAP; outpost run by authentik, tasks/ldap.yaml) -----
+  # Members are added by Ansible and in the UI: a `users` attr here would replace
+  # the whole member list on every apply.
+  - model: authentik_core.group
+    id: super-admins
+    identifiers:
+      name: {{ superadmin_group }}
+  - model: authentik_providers_ldap.ldapprovider
+    id: super-admin-ldap-provider
+    identifiers:
+      name: super-admin-ldap
+    attrs:
+      # LDAP "Bind flow" (MFA included: TOTP users send password;code) and
+      # "Unbind flow" (its logout stage ends the session each bind creates)
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
+      base_dn: {{ authentik_ldap_base_dn }}
+      bind_mode: direct
+      search_mode: direct
+      mfa_support: true
+  - model: authentik_core.application
+    id: super-admin-ldap-app
+    identifiers:
+      slug: super-admin-ldap
+    attrs:
+      name: Super-admin console (LDAP)
+      provider: !KeyOf super-admin-ldap-provider
+      meta_hide: true
+  # Without a binding every active user could bind.
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf super-admin-ldap-app
+      group: !KeyOf super-admins
+    attrs:
+      order: 0
+  # Created by the worker on its own when authentik runs in the cluster; declared
+  # so the outpost below never ends up without a connection.
+  - model: authentik_outposts.kubernetesserviceconnection
+    id: local-k8s
+    identifiers:
+      name: Local Kubernetes Cluster
+    attrs:
+      local: true
+  - model: authentik_outposts.outpost
+    identifiers:
+      name: {{ authentik_ldap_outpost_name }}
+    attrs:
+      type: ldap
+      service_connection: !KeyOf local-k8s
+      providers:
+        - !KeyOf super-admin-ldap-provider
+      config:
+        authentik_host: {{ authentik_internal_url }}
+        kubernetes_namespace: {{ authentik_namespace }}
+        kubernetes_replicas: {{ authentik_ldap_outpost_replicas }}
+        kubernetes_service_type: ClusterIP
+        kubernetes_json_patches:
+          deployment:
+            - op: add
+              path: /spec/template/spec/nodeSelector
+              value: {{ platform_primary_site_selector | to_json }}
+            - op: add
+              path: /spec/template/spec/topologySpreadConstraints
+              value:
+                - maxSkew: 1
+                  topologyKey: kubernetes.io/hostname
+                  whenUnsatisfiable: ScheduleAnyway
+                  labelSelector:
+                    matchLabels: { goauthentik.io/outpost-name: {{ authentik_ldap_outpost_name }} }
+            - op: add
+              path: /spec/template/spec/containers/0/resources
+              value: {{ authentik_ldap_outpost_resources | to_json }}
+{% endif %}

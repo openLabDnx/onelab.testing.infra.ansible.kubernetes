@@ -1,0 +1,37 @@
+# Super Admin API PostgreSQL + PostGIS (Managed by Ansible)
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ superadmin_db_cluster }}
+  namespace: {{ superadmin_namespace }}
+spec:
+  instances: {{ superadmin_db_instances }}
+  imageName: {{ superadmin_db_image }}
+  primaryUpdateStrategy: unsupervised
+  bootstrap:
+    initdb:
+      database: autofik_super
+      owner: autofik_admin
+      # The API's first migration also asks for it, but only a superuser may create it.
+      postInitApplicationSQL:
+        - CREATE EXTENSION IF NOT EXISTS postgis
+  storage:
+    size: {{ superadmin_db_size }}
+    storageClass: {{ superadmin_db_storage_class }}
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+  affinity:
+    nodeSelector:
+      {{ platform_primary_site_selector | to_nice_yaml | trim | indent(6) }}
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
