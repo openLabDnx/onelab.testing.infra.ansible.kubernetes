@@ -41,6 +41,8 @@ authentik_ldap_outpost_resources:
 # Namespaces whose pods may connect to the outpost (NetworkPolicy).
 authentik_ldap_client_namespaces:
   - "{{ superadmin_namespace }}"
+  # The Super Admin API as deployed by Argo CD (autofik.api.dev.supper.admin-api).
+  - "supper-admin-api"
 # Usernames ADDED to superadmin_group on every run. Nobody is ever removed and
 # users that do not exist yet are skipped; manage everyone else in the UI.
 superadmin_members:

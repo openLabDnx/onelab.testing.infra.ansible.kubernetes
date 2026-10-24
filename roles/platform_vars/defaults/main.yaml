@@ -12,6 +12,8 @@ kafka_ui_host: "kafka.{{ platform_domain }}"
 grafana_host: "grafana.{{ platform_domain }}"
 jaeger_host: "jaeger.{{ platform_domain }}"
 longhorn_host: "longhorn.{{ platform_domain }}"
+# The admin gateway (KYC review); its IngressRoute is deployment/gateway/admin.gateway/ingress.testing.yml
+admin_gateway_host: "admin-gateway.{{ platform_domain }}"
 
 authentik_namespace: "authentik"
 argocd_namespace: "argocd"
@@ -33,6 +35,7 @@ platform_forward_auth_apps:
   - { slug: kafka-ui, name: "Kafka UI", host: "{{ kafka_ui_host }}", launch_path: / }
   - { slug: jaeger, name: "Jaeger", host: "{{ jaeger_host }}", launch_path: /search }
   - { slug: longhorn, name: "Longhorn", host: "{{ longhorn_host }}", launch_path: / }
+  - { slug: admin-gateway, name: "Admin gateway", host: "{{ admin_gateway_host }}", launch_path: /admin/v1/mechanics }
 
 # Generated credentials live here on the controller (git-ignored)
 platform_secrets_dir: "{{ inventory_dir }}/../secrets/platform"
